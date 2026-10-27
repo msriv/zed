@@ -228,7 +228,9 @@ pub fn hang_traces_dir() -> &'static PathBuf {
 pub fn logs_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
     LOGS_DIR.get_or_init(|| {
-        if cfg!(target_os = "macos") {
+        if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
+            custom_dir.join("logs")
+        } else if cfg!(target_os = "macos") {
             home_dir().join("Library/Logs").join(APP_NAME)
         } else {
             data_dir().join("logs")
@@ -634,4 +636,17 @@ pub fn global_gitignore_path() -> Option<PathBuf> {
     GLOBAL_GITIGNORE_PATH
         .get_or_init(::ignore::gitignore::gitconfig_excludes_path)
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_paths_respect_custom_data_directory() {
+        let custom_dir = std::env::temp_dir().join("zed-custom-log-test");
+        assert!(CUSTOM_DATA_DIR.set(custom_dir.clone()).is_ok());
+        assert_eq!(logs_dir(), &custom_dir.join("logs"));
+        assert_eq!(log_file(), &custom_dir.join("logs").join("Zed.log"));
+    }
 }

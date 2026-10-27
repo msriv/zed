@@ -19,6 +19,8 @@ pub struct TerminalToolHeader {
     id: SharedString,
     hover_group: SharedString,
     working_dir: SharedString,
+    summary: Option<SharedString>,
+    completed: bool,
     is_expanded: bool,
     elapsed: Option<Duration>,
     running: bool,
@@ -42,6 +44,8 @@ impl TerminalToolHeader {
             id: id.into(),
             hover_group: hover_group.into(),
             working_dir: working_dir.into(),
+            summary: None,
+            completed: false,
             is_expanded,
             elapsed: None,
             running: false,
@@ -53,6 +57,16 @@ impl TerminalToolHeader {
             on_stop: None,
             command_slot: None,
         }
+    }
+
+    pub fn summary(mut self, summary: impl Into<SharedString>) -> Self {
+        self.summary = Some(summary.into());
+        self
+    }
+
+    pub fn completed(mut self, completed: bool) -> Self {
+        self.completed = completed;
+        self
     }
 
     pub fn elapsed(mut self, elapsed: Duration) -> Self {
@@ -113,6 +127,8 @@ impl RenderOnce for TerminalToolHeader {
             id,
             hover_group,
             working_dir,
+            summary,
+            completed,
             is_expanded,
             elapsed,
             running,
@@ -134,28 +150,56 @@ impl RenderOnce for TerminalToolHeader {
             .blend(cx.theme().colors().editor_foreground.opacity(0.025));
 
         let header_row = h_flex()
+            .debug_selector({
+                let selector = child_id("header-row");
+                move || selector.clone()
+            })
             .id(child_id("header"))
-            .pt_1()
-            .pl_1p5()
-            .pr_1()
+            .py_2()
+            .px_3()
             .flex_none()
             .gap_1()
             .justify_between()
             .rounded_t_md()
+            .child(if running {
+                Icon::new(IconName::LoadCircle)
+                    .size(IconSize::Small)
+                    .color(Color::Accent)
+                    .with_rotate_animation(2)
+                    .into_any_element()
+            } else {
+                Icon::new(if failed {
+                    IconName::Close
+                } else if completed {
+                    IconName::Check
+                } else {
+                    IconName::Circle
+                })
+                .size(IconSize::Small)
+                .color(if failed {
+                    Color::Error
+                } else if completed {
+                    Color::Success
+                } else {
+                    Color::Muted
+                })
+                .into_any_element()
+            })
             .child(
                 div().w_full().min_w_0().overflow_hidden().child(
-                    Label::new(working_dir)
-                        .buffer_font(cx)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate_start(),
+                    Label::new(summary.clone().unwrap_or(working_dir))
+                        .size(if summary.is_some() {
+                            LabelSize::Small
+                        } else {
+                            LabelSize::XSmall
+                        })
+                        .truncate(),
                 ),
             )
             .child(
                 Disclosure::new(child_id("disclosure"), is_expanded)
                     .opened_icon(IconName::ChevronUp)
                     .closed_icon(IconName::ChevronDown)
-                    .visible_on_hover(&hover_group)
                     .when_some(on_toggle_expand, |this, handler| this.on_click(handler)),
             )
             .when(show_elapsed, |header| {
@@ -170,33 +214,25 @@ impl RenderOnce for TerminalToolHeader {
                 )
             })
             .when(running, |header| {
-                header
-                    .gap_1p5()
-                    .child(
-                        Icon::new(IconName::LoadCircle)
-                            .size(IconSize::Small)
-                            .color(Color::Muted)
-                            .with_rotate_animation(2),
-                    )
-                    .when_some(on_stop, |header, handler| {
-                        header
-                            .child(Divider::vertical().color(DividerColor::Border).ml_1())
-                            .child(
-                                IconButton::new(child_id("stop"), IconName::Stop)
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Error)
-                                    .tooltip(move |_window, cx| {
-                                        Tooltip::with_meta(
-                                            "Stop This Command",
-                                            None,
-                                            "Also possible by placing your cursor inside the \
+                header.gap_1p5().when_some(on_stop, |header, handler| {
+                    header
+                        .child(Divider::vertical().color(DividerColor::Border).ml_1())
+                        .child(
+                            IconButton::new(child_id("stop"), IconName::Stop)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Error)
+                                .tooltip(move |_window, cx| {
+                                    Tooltip::with_meta(
+                                        "Stop This Command",
+                                        None,
+                                        "Also possible by placing your cursor inside the \
                                              terminal and using regular terminal bindings.",
-                                            cx,
-                                        )
-                                    })
-                                    .on_click(handler),
-                            )
-                    })
+                                        cx,
+                                    )
+                                })
+                                .on_click(handler),
+                        )
+                })
             })
             .when_some(truncated_tooltip, |header, tooltip| {
                 header.child(
@@ -255,6 +291,65 @@ impl RenderOnce for TerminalToolHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn long_command_stays_compact_and_can_be_expanded(cx: &mut gpui::TestAppContext) {
+        struct Header {
+            expanded: bool,
+        }
+        impl Render for Header {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(
+                    div()
+                        .w(px(240.))
+                        .debug_selector(|| "compact-terminal-header".into())
+                        .child(
+                            TerminalToolHeader::new(
+                                "compact",
+                                "compact",
+                                "/project",
+                                self.expanded,
+                            )
+                            .summary("Inspect project files ".repeat(30))
+                            .completed(true)
+                            .on_toggle_expand(cx.listener(|this, _, _, cx| {
+                                this.expanded = !this.expanded;
+                                cx.notify();
+                            }))
+                            .when(self.expanded, |header| {
+                                header.command_slot(
+                                    div()
+                                        .debug_selector(|| "expanded-terminal-command".into())
+                                        .child("full command"),
+                                )
+                            }),
+                        ),
+                )
+            }
+        }
+        crate::test_support::init_test(cx);
+        let (header, cx) = cx.add_window_view(|_, _| Header { expanded: false });
+        cx.run_until_parked();
+        let bounds = cx
+            .debug_bounds("compact-terminal-header")
+            .expect("header container");
+        assert_eq!(bounds.size.width, px(240.));
+        let row = cx
+            .debug_bounds("terminal-tool-header-row-compact")
+            .expect("header row");
+        assert!(
+            row.size.height < px(60.),
+            "collapsed command must remain a single compact row: {row:?}"
+        );
+        assert!(cx.debug_bounds("expanded-terminal-command").is_none());
+        let disclosure = cx
+            .debug_bounds("ICON-ChevronDown")
+            .expect("visible disclosure");
+        assert!(disclosure.right() <= bounds.right());
+        cx.simulate_click(disclosure.center(), gpui::Modifiers::default());
+        assert!(header.read_with(cx, |header, _| header.expanded));
+        assert!(cx.debug_bounds("expanded-terminal-command").is_some());
+    }
 
     #[gpui::test]
     fn running_header_only_offers_stop_when_control_is_available(cx: &mut gpui::TestAppContext) {

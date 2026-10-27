@@ -1,0 +1,88 @@
+Zed Agent Redesign — local development preview
+
+App: ~/Applications/Zed Agent Redesign.app
+Source: ~/Developer/zed-agent-redesign
+Branch: agent-panel-redesign, based on ec86047d67acd6fddd81392f44ed6ebcc6e7f531.
+Source branch: agent-panel-redesign in https://github.com/msriv/zed.
+No pull request has been opened.
+
+Original Zed updated on October 27, 2026:
+- /Applications/Zed.app now contains this same verified Agent Panel build.
+- It retains the original dev.zed.Zed identity, icons and bundled CLI/git.
+- Its launcher uses the stable channel and the original settings/history paths;
+  it does not pass --user-data-dir or copy the preview profile into the original.
+- Automatic updates are disabled for this local build so they cannot replace it.
+- The full bundle was signed and verified, the native UUID matches the tested
+  build, and its launcher/CLI checks passed without opening the live profile.
+- No running app was stopped. Fully quit and reopen the original Zed to load it.
+- Rollback app, settings and consistent SQLite snapshots are saved under:
+  ~/Library/Application Support/Zed Local Backups/20261027-165206
+  See that directory's RESTORE.txt before rolling back after using the new build.
+
+Implemented: workspace-local thread/terminal tabs, status indicators, safe tab
+closing, lazy restoration, grouped searchable thread picker, and a New Thread
+empty state. Cmd-K opens the picker while the Agent Panel is focused. Existing
+Ctrl-Tab quick switching remains available.
+
+The conversation renderer now uses right-aligned user bubbles, grouped tool
+activity with working-directory/status summaries, compact terminal/tool rows,
+collapsible command output, and a compact pinned composer. Running output follows
+new text only while already at the bottom; manual scrollback is preserved.
+Native and external agents use the same renderer. Existing expansion preferences,
+permissions, stop controls, search, edit/rewind, and composer controls are retained.
+
+Fully quit and reopen Zed Agent Redesign to load the installed executable. The
+current session was left running during installation.
+
+The preview uses ~/Library/Application Support/Zed Agent Redesign for its config,
+database, extensions and logs. It copies appearance/preferences, not conversation
+history. Its initial optional threads sidebar is collapsed. The preview's layout
+state backup is before-preview-layout.sqlite inside that profile.
+
+This is a development build. Its launcher and runtime assets require this source
+checkout to stay at its current path. It is not a distributable release package.
+
+Verification on October 27, 2026:
+- Full native Agent UI suite: 594 passed, 0 failed.
+- Native sidebar suite: 162 passed.
+- Tab-filter suite: 19 passed.
+- Pending-terminal suite: 6 passed, including rendered focus checks.
+- Additional status, serialization, retention, queue, permission and draft tests passed.
+- Custom-profile log-path test passed; old behavior fails that test.
+- Tab lifecycle regression fails when registration is removed and passes restored.
+- Native app build, action registration, formatting and whitespace checks passed.
+- Preview was launched and its project/editor/agent layout captured.
+- Real GPUI/Metal conversation previews at 420 and 560 logical pixels were
+  captured and visually reviewed, including long output and the actual command.
+  Images: target/visual_tests/agent_conversation_redesign_420.png and
+  target/visual_tests/agent_conversation_redesign_560.png.
+- Repeated native snapshot comparison: both previews matched 100%.
+- The app executable was signed, atomically replaced, and verified against the
+  build's Mach-O UUID without restarting the active app.
+
+Validation used a stub agent and display-only terminal data; no prompts or tool
+commands were sent to a live agent. Live authentication and manual keyboard/
+attachment interactions were not rechecked. macOS denied automated keystrokes.
+Authentication, MCP configuration, and the live profile/database were not changed.
+
+Build from this checkout with the already installed toolchain/cache:
+  source ~/.cargo/env
+  PATH=/opt/homebrew/bin:$PATH \
+  LK_CUSTOM_WEBRTC="$PWD/target/native-deps/mac-arm64-release" \
+  CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=0 \
+  CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4 cargo build -p zed --bin zed
+
+The cached native dependency is the upstream WebRTC release webrtc-0001d84-4,
+mac-arm64-release, verified against GitHub's published archive SHA-256:
+09ba71bfbc15c6aacced7fe20451a9648dfe648c24295f28d75fc386dbd7281a.
+The build command assumes that cache remains present; cargo clean removes it.
+Rebuilding does not automatically replace the copied executable in the app.
+
+To capture the native conversation fixture, use the same build environment with:
+  VISUAL_TEST_FILTER=agent_conversation_redesign \
+  VISUAL_TEST_OUTPUT_DIR=target/visual_tests \
+  cargo run -p zed --bin zed_visual_test_runner --features visual-tests
+The runner requires macOS window-server access. To intentionally refresh the
+local ignored baselines, add UPDATE_BASELINE=1 after reviewing the layout.
+
+Detailed temporary validation logs are under /private/tmp/zed-*.log.

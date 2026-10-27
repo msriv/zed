@@ -6045,9 +6045,10 @@ pub(crate) mod tests {
         thread_view.read_with(cx, |view, cx| {
             assert_eq!(view.thread.read(cx).entries().len(), 1);
             assert!(!view.can_edit_user_message(0, cx));
+            assert!(!view.editor_expanded);
             assert!(matches!(
                 view.message_editor.read(cx).editor().read(cx).mode(),
-                editor::EditorMode::Full { .. }
+                editor::EditorMode::AutoHeight { .. }
             ));
         });
         thread.update(cx, |thread, cx| {
@@ -15665,6 +15666,253 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_empty_first_prompt_composer_expands_and_minimizes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        cx.simulate_resize(size(px(480.), px(640.)));
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        cx.run_until_parked();
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let editor = message_editor(&conversation_view, cx);
+        let compact_height = editor.read_with(cx, |editor, cx| {
+            editor
+                .editor()
+                .read(cx)
+                .last_bounds()
+                .expect("compact composer")
+                .size
+                .height
+        });
+        let expand = cx
+            .debug_bounds("ICON-Maximize")
+            .expect("empty composer expand button");
+        cx.simulate_click(expand.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        thread_view.update(cx, |view, cx| {
+            assert!(view.editor_expanded);
+            assert!(view.thread.read(cx).entries().is_empty());
+            view.sync_editor_mode(cx);
+            assert!(
+                view.editor_expanded,
+                "editor synchronization must preserve explicit expansion"
+            );
+            assert!(matches!(
+                view.message_editor.read(cx).editor().read(cx).mode(),
+                EditorMode::Full { .. }
+            ));
+        });
+        cx.run_until_parked();
+        editor.read_with(cx, |editor, cx| {
+            assert!(editor.is_empty(cx));
+            assert!(
+                editor
+                    .editor()
+                    .read(cx)
+                    .last_bounds()
+                    .expect("expanded composer")
+                    .size
+                    .height
+                    > compact_height
+            );
+        });
+
+        let minimize = cx
+            .debug_bounds("ICON-Minimize")
+            .expect("empty composer minimize button");
+        cx.simulate_click(minimize.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, cx| {
+            assert!(!view.editor_expanded);
+            assert!(view.thread.read(cx).entries().is_empty());
+            assert!(matches!(
+                view.message_editor.read(cx).editor().read(cx).mode(),
+                EditorMode::AutoHeight { .. }
+            ));
+        });
+        assert!(cx.debug_bounds("ICON-Maximize").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_tool_activity_group_skips_hidden_canceled_neighbors(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        for (id, status) in [
+            ("hidden-first", acp_v2::ToolCallStatus::Cancelled),
+            ("visible-first", acp_v2::ToolCallStatus::Completed),
+            ("hidden-middle", acp_v2::ToolCallStatus::Cancelled),
+            ("visible-last", acp_v2::ToolCallStatus::InProgress),
+            ("hidden-last", acp_v2::ToolCallStatus::Cancelled),
+        ] {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .upsert_wire_tool_call(
+                        acp_v2::ToolCallUpdate::new(id)
+                            .title(id)
+                            .kind(acp_v2::ToolKind::Read)
+                            .status(status),
+                        cx,
+                    )
+                    .expect("fixture tool update");
+            });
+        }
+        thread.read_with(cx, |thread, _| assert_eq!(thread.entries().len(), 5));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-activity-group-header-1").is_some());
+        assert!(cx.debug_bounds("tool-activity-row-1-true-false").is_some());
+        assert!(cx.debug_bounds("tool-activity-row-3-false-true").is_some());
+        assert!(
+            cx.debug_bounds("tool-activity-summary-1-1 running · 2 tools")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("tool-activity-group-header-0").is_none());
+        assert!(cx.debug_bounds("tool-activity-row-0-true-false").is_none());
+        assert!(cx.debug_bounds("tool-activity-row-4-false-true").is_none());
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new("visible-last")
+                        .status(acp_v2::ToolCallStatus::Cancelled),
+                    cx,
+                )
+                .expect("cancel the final visible tool");
+            assert_eq!(
+                thread.entries().len(),
+                5,
+                "rendering must not delete engine entries"
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-activity-group-header-1").is_some());
+        assert!(cx.debug_bounds("tool-activity-row-1-true-true").is_some());
+        assert!(
+            cx.debug_bounds("tool-activity-summary-1-1/1 completed")
+                .is_some()
+        );
+        assert!(cx.debug_bounds("tool-activity-row-3-false-true").is_none());
+        thread_view.read_with(cx, |view, cx| {
+            assert_thread_list_item_count_matches_entries(view, cx)
+        });
+    }
+
+    #[gpui::test]
+    async fn test_inline_terminal_output_follows_tail_until_user_scrolls_away(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        cx.simulate_resize(size(px(480.), px(800.)));
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let tool_id = acp_v2::ToolCallId::new("live-output-tool");
+        let terminal_id = acp_v2::TerminalId::new("live-output-terminal");
+        thread.update(cx, |thread, cx| {
+            thread
+                .upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new(tool_id.clone())
+                        .title("Run conversation tests")
+                        .kind(acp_v2::ToolKind::Execute)
+                        .status(acp_v2::ToolCallStatus::InProgress)
+                        .content(vec![acp_v2::ToolCallContent::Terminal(
+                            acp_v2::Terminal::new(terminal_id.clone()),
+                        )]),
+                    cx,
+                )
+                .expect("running display terminal");
+        });
+        cx.run_until_parked();
+        conversation_view.update(cx, |view, cx| view.expand_tool_call(tool_id, cx));
+        cx.run_until_parked();
+        thread.update(cx, |thread, cx| {
+            thread
+                .append_display_terminal_output(
+                    terminal_id.clone(),
+                    "test conversation_layout ... ok\r\n".repeat(60).as_bytes(),
+                    cx,
+                )
+                .expect("initial terminal output");
+        });
+        cx.run_until_parked();
+        let terminal = thread.read_with(cx, |thread, _| {
+            thread.terminal(terminal_id.clone()).expect("terminal")
+        });
+        assert!(!terminal.read_with(cx, |terminal, _| terminal.is_process_backed()));
+        let scroll = thread_view.read_with(cx, |view, cx| {
+            view.entry_view_state
+                .read(cx)
+                .entry(0)
+                .and_then(|entry| entry.terminal_output_scroll_handle(&terminal))
+                .expect("inline terminal scroll handle")
+        });
+        assert!(scroll.bounds().size.height > px(0.));
+        assert!(
+            scroll.max_offset().y > px(100.),
+            "long output must exceed the inline viewport"
+        );
+        assert_eq!(
+            scroll.offset().y,
+            -scroll.max_offset().y,
+            "initial output should show its tail"
+        );
+        let initial_max_offset = scroll.max_offset().y;
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .append_display_terminal_output(
+                    terminal_id.clone(),
+                    "test appended_layout ... ok\r\n".repeat(10).as_bytes(),
+                    cx,
+                )
+                .expect("append while following");
+        });
+        cx.run_until_parked();
+        assert!(scroll.max_offset().y > initial_max_offset);
+        assert_eq!(
+            scroll.offset().y,
+            -scroll.max_offset().y,
+            "new output should remain visible at the tail"
+        );
+
+        scroll.set_offset(point(px(0.), px(-40.)));
+        thread.update(cx, |thread, cx| {
+            thread
+                .append_display_terminal_output(
+                    terminal_id.clone(),
+                    b"output while reading earlier lines\r\n",
+                    cx,
+                )
+                .expect("append away from tail");
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            scroll.offset().y,
+            px(-40.),
+            "new output must preserve a user scroll position"
+        );
+
+        scroll.set_offset(point(px(0.), -scroll.max_offset().y));
+        thread.update(cx, |thread, cx| {
+            thread
+                .append_display_terminal_output(terminal_id, b"back at the live tail\r\n", cx)
+                .expect("append after returning to tail");
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            scroll.offset().y,
+            -scroll.max_offset().y,
+            "returning to the tail should resume following"
+        );
+    }
+
+    #[gpui::test]
     async fn test_terminal_snapshots_reuse_the_read_only_tool_view(cx: &mut TestAppContext) {
         init_test(cx);
         let (conversation_view, cx) =
@@ -18608,7 +18856,7 @@ pub(crate) mod tests {
             request_test_generic_permission(&thread, request.clone(), cx);
         cx.run_until_parked();
         let card = cx
-            .debug_bounds("tool-call-permission-tool-standalone")
+            .debug_bounds("tool-call-permission-tool-embedded")
             .expect("existing tool card");
         for request_id in [first_id, second_id] {
             let selector = Box::leak(
@@ -18670,7 +18918,7 @@ pub(crate) mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("standalone-generic-permissions").is_none());
         assert!(
-            cx.debug_bounds("tool-call-late-permission-tool-standalone")
+            cx.debug_bounds("tool-call-late-permission-tool-embedded")
                 .is_some()
         );
         click_generic_permission(request_id, Some("reject"), cx);
@@ -19209,7 +19457,7 @@ pub(crate) mod tests {
         assert!(cx.debug_bounds(root_selector).is_none());
         assert!(cx.debug_bounds("standalone-generic-permissions").is_none());
         let child_card = cx
-            .debug_bounds("tool-call-shared-permission-tool-standalone")
+            .debug_bounds("tool-call-shared-permission-tool-embedded")
             .expect("child tool card");
         let child_selector =
             Box::leak(format!("generic-permission-cancel-{child_id:?}").into_boxed_str());

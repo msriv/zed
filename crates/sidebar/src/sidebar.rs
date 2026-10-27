@@ -76,7 +76,7 @@ use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
 use zed_actions::editor::{MoveDown, MoveUp};
 use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, OpenRecent};
 
-use zed_actions::agents_sidebar::{FocusSidebarFilter, ToggleThreadSwitcher};
+use zed_actions::agents_sidebar::{FocusSidebarFilter, OpenThreadPicker, ToggleThreadSwitcher};
 
 use crate::thread_switcher::{
     ThreadSwitcher, ThreadSwitcherEntry, ThreadSwitcherEvent, ThreadSwitcherSelection,
@@ -806,6 +806,7 @@ pub struct Sidebar {
     thread_last_accessed: HashMap<ThreadId, DateTime<Utc>>,
     terminal_last_accessed: HashMap<TerminalId, DateTime<Utc>>,
     thread_switcher: Option<Entity<ThreadSwitcher>>,
+    thread_picker_entries: Vec<ListEntry>,
     _thread_switcher_subscriptions: Vec<gpui::Subscription>,
     pending_thread_activation: Option<agent_ui::ThreadId>,
     /// Persists live thread statuses across rebuilds so that Running→Completed
@@ -963,6 +964,7 @@ impl Sidebar {
             thread_last_accessed: HashMap::new(),
             terminal_last_accessed: HashMap::new(),
             thread_switcher: None,
+            thread_picker_entries: Vec::new(),
             _thread_switcher_subscriptions: Vec::new(),
             pending_thread_activation: None,
             live_thread_statuses: HashMap::new(),
@@ -1399,6 +1401,14 @@ impl Sidebar {
     /// - Should always show every thread, associated with each workspace in the multiworkspace
     /// - After every build_contents, our "active" state should exactly match the current workspace's, current agent panel's current thread.
     fn rebuild_contents(&mut self, cx: &App) {
+        let collect_picker_entries = self
+            .thread_switcher
+            .as_ref()
+            .is_some_and(|switcher| switcher.read(cx).is_picker());
+        self.rebuild_contents_impl(collect_picker_entries, cx);
+    }
+
+    fn rebuild_contents_impl(&mut self, collect_picker_entries: bool, cx: &App) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
@@ -1417,6 +1427,7 @@ impl Sidebar {
         let old_statuses = &self.live_thread_statuses;
 
         let mut entries = Vec::new();
+        let mut picker_entries = Vec::new();
         let mut notified_threads = previous.notified_threads;
         let mut notified_terminals: HashSet<TerminalId> = HashSet::new();
         let mut new_live_statuses: HashMap<acp::SessionId, (AgentThreadStatus, ThreadId)> =
@@ -1600,7 +1611,7 @@ impl Sidebar {
             let label = group_key.display_name(&path_detail_map);
 
             let is_collapsed = self.is_group_collapsed(group_key, cx);
-            let should_load_threads = !is_collapsed || !query.is_empty();
+            let should_load_threads = !is_collapsed || !query.is_empty() || collect_picker_entries;
 
             let is_active = active_workspace
                 .as_ref()
@@ -1871,6 +1882,26 @@ impl Sidebar {
             };
             let has_threads = has_visible_rows || has_stored_thread_rows;
 
+            if collect_picker_entries {
+                picker_entries.push(ListEntry::ProjectHeader {
+                    key: group_key.clone(),
+                    label: label.clone(),
+                    highlight_positions: Vec::new(),
+                    has_running_threads,
+                    waiting_thread_count,
+                    has_notifications: false,
+                    is_active,
+                    has_threads,
+                });
+                Self::push_entries_by_display_time(
+                    &mut picker_entries,
+                    terminals.clone(),
+                    threads.clone(),
+                    &mut current_session_ids,
+                    &mut current_thread_ids,
+                );
+            }
+
             if !query.is_empty() {
                 let workspace_highlight_positions =
                     fuzzy_match_positions(&query, &label).unwrap_or_default();
@@ -2028,6 +2059,7 @@ impl Sidebar {
             project_header_indices,
             has_open_projects,
         };
+        self.thread_picker_entries = picker_entries;
     }
 
     fn schedule_update_entries(&mut self, select_first_after_update: bool, cx: &mut Context<Self>) {
@@ -2062,6 +2094,14 @@ impl Sidebar {
             self.entry_shapes(multi_workspace.read(cx)).collect();
 
         self.rebuild_contents(cx);
+        if let Some(picker) = self
+            .thread_switcher
+            .clone()
+            .filter(|switcher| switcher.read(cx).is_picker())
+        {
+            let entries = self.entries_for_switcher(&self.thread_picker_entries, true, cx);
+            picker.update(cx, |picker, cx| picker.update_picker_entries(entries, cx));
+        }
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
 
@@ -5923,11 +5963,18 @@ impl Sidebar {
     }
 
     fn mru_entries_for_switcher(&self, cx: &App) -> Vec<ThreadSwitcherEntry> {
+        self.entries_for_switcher(&self.contents.entries, false, cx)
+    }
+
+    fn entries_for_switcher(
+        &self,
+        source: &[ListEntry],
+        include_closed: bool,
+        cx: &App,
+    ) -> Vec<ThreadSwitcherEntry> {
         let mut current_header_label: Option<SharedString> = None;
         let mut current_header_key: Option<ProjectGroupKey> = None;
-        let mut entries: Vec<ThreadSwitcherEntry> = self
-            .contents
-            .entries
+        let mut entries: Vec<ThreadSwitcherEntry> = source
             .iter()
             .filter_map(|entry| match entry {
                 ListEntry::ProjectHeader { label, key, .. } => {
@@ -5940,15 +5987,20 @@ impl Sidebar {
                         return None;
                     }
                     let workspace = match &thread.workspace {
-                        ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
+                        workspace if include_closed => Some(workspace.clone()),
+                        ThreadEntryWorkspace::Open(workspace) => {
+                            Some(ThreadEntryWorkspace::Open(workspace.clone()))
+                        }
                         ThreadEntryWorkspace::Closed { .. } => {
                             current_header_key.as_ref().and_then(|key| {
                                 self.multi_workspace.upgrade().and_then(|mw| {
-                                    mw.read(cx).workspace_for_paths(
-                                        key.path_list(),
-                                        key.host().as_ref(),
-                                        cx,
-                                    )
+                                    mw.read(cx)
+                                        .workspace_for_paths(
+                                            key.path_list(),
+                                            key.host().as_ref(),
+                                            cx,
+                                        )
+                                        .map(ThreadEntryWorkspace::Open)
                                 })
                             })
                         }
@@ -5964,6 +6016,7 @@ impl Sidebar {
                         status: thread.status,
                         metadata: thread.metadata.clone(),
                         workspace,
+                        project_group_key: current_header_key.clone(),
                         project_name: current_header_label.clone(),
                         worktrees: thread
                             .worktrees
@@ -5987,6 +6040,7 @@ impl Sidebar {
                     Some(ThreadSwitcherEntry::Terminal(ThreadSwitcherTerminalEntry {
                         metadata: terminal.metadata.clone(),
                         workspace: terminal.workspace.clone(),
+                        project_group_key: current_header_key.clone(),
                         project_name: current_header_label.clone(),
                         worktrees: terminal
                             .worktrees
@@ -6013,6 +6067,7 @@ impl Sidebar {
 
     fn dismiss_thread_switcher(&mut self, cx: &mut Context<Self>) {
         self.thread_switcher = None;
+        self.thread_picker_entries.clear();
         self._thread_switcher_subscriptions.clear();
         if let Some(mw) = self.multi_workspace.upgrade() {
             mw.update(cx, |mw, cx| {
@@ -6030,6 +6085,66 @@ impl Sidebar {
         self.toggle_thread_switcher_impl(action.select_last, window, cx);
     }
 
+    fn on_open_thread_picker(
+        &mut self,
+        _: &OpenThreadPicker,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_thread_picker_impl(window, cx);
+    }
+
+    fn open_thread_picker_impl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(picker) = self
+            .thread_switcher
+            .as_ref()
+            .filter(|switcher| switcher.read(cx).is_picker())
+        {
+            window.focus(&picker.focus_handle(cx), cx);
+            return;
+        }
+        if self.thread_switcher.is_some() {
+            return;
+        }
+        let original_focus = window.focused(cx);
+        self.rebuild_contents_impl(true, cx);
+        let entries = self.entries_for_switcher(&self.thread_picker_entries, true, cx);
+        let current_project = self.active_project_group_key(cx);
+        let picker = cx.new(|cx| ThreadSwitcher::new_picker(entries, current_project, window, cx));
+        let subscriptions = vec![
+            cx.subscribe_in(
+                &picker,
+                window,
+                move |this, _, event: &ThreadSwitcherEvent, window, cx| match event {
+                    ThreadSwitcherEvent::Confirmed(selection) => {
+                        this.confirm_switcher_selection(selection, window, cx)
+                    }
+                    ThreadSwitcherEvent::Dismissed => {
+                        this.dismiss_thread_switcher(cx);
+                        if let Some(focus) = &original_focus {
+                            window.focus(focus, cx);
+                        }
+                    }
+                    ThreadSwitcherEvent::Preview(_) => {}
+                },
+            ),
+            cx.subscribe_in(&picker, window, |this, _, _: &DismissEvent, _, cx| {
+                this.dismiss_thread_switcher(cx)
+            }),
+        ];
+        let focus = picker.focus_handle(cx);
+        let overlay = gpui::AnyView::from(picker.clone());
+        self.thread_switcher = Some(picker);
+        self._thread_switcher_subscriptions = subscriptions;
+        if let Some(multi_workspace) = self.multi_workspace.upgrade() {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.set_sidebar_overlay(Some(overlay), cx)
+            });
+        }
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
     fn preview_switcher_selection(
         &mut self,
         selection: &ThreadSwitcherSelection,
@@ -6039,7 +6154,7 @@ impl Sidebar {
         match selection {
             ThreadSwitcherSelection::Thread {
                 metadata,
-                workspace,
+                workspace: ThreadEntryWorkspace::Open(workspace),
             } => {
                 if let Some(multi_workspace) = self.multi_workspace.upgrade() {
                     multi_workspace.update(cx, |multi_workspace, cx| {
@@ -6054,6 +6169,10 @@ impl Sidebar {
                 self.update_entries(cx);
                 Self::load_agent_thread_in_workspace(workspace, metadata, false, window, cx);
             }
+            ThreadSwitcherSelection::Thread {
+                workspace: ThreadEntryWorkspace::Closed { .. },
+                ..
+            } => {}
             ThreadSwitcherSelection::Terminal {
                 metadata,
                 workspace,
@@ -6084,7 +6203,7 @@ impl Sidebar {
         match selection {
             ThreadSwitcherSelection::Thread {
                 metadata,
-                workspace,
+                workspace: ThreadEntryWorkspace::Open(workspace),
             } => {
                 if let Some(multi_workspace) = self.multi_workspace.upgrade() {
                     multi_workspace.update(cx, |multi_workspace, cx| {
@@ -6101,6 +6220,24 @@ impl Sidebar {
                 self.update_entries(cx);
                 self.dismiss_thread_switcher(cx);
                 Self::load_agent_thread_in_workspace(workspace, metadata, true, window, cx);
+            }
+            ThreadSwitcherSelection::Thread {
+                metadata,
+                workspace:
+                    ThreadEntryWorkspace::Closed {
+                        folder_paths,
+                        project_group_key,
+                    },
+            } => {
+                self.dismiss_thread_switcher(cx);
+                self.record_thread_access(&metadata.thread_id);
+                self.open_workspace_and_activate_thread(
+                    metadata.clone(),
+                    folder_paths.clone(),
+                    project_group_key,
+                    window,
+                    cx,
+                );
             }
             ThreadSwitcherSelection::Terminal {
                 metadata,
@@ -7937,6 +8074,10 @@ impl WorkspaceSidebar for Sidebar {
         self.toggle_thread_switcher_impl(select_last, window, cx);
     }
 
+    fn open_thread_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_thread_picker_impl(window, cx);
+    }
+
     fn cycle_project(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.cycle_project_impl(forward, window, cx);
     }
@@ -8026,6 +8167,7 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::toggle_archive))
             .on_action(cx.listener(Self::focus_sidebar_filter))
             .on_action(cx.listener(Self::on_toggle_thread_switcher))
+            .on_action(cx.listener(Self::on_open_thread_picker))
             .on_action(cx.listener(Self::on_next_project))
             .on_action(cx.listener(Self::on_previous_project))
             .on_action(cx.listener(Self::on_next_thread))
@@ -8146,9 +8288,7 @@ fn all_thread_infos_for_workspace(
         .conversation_views()
         .into_iter()
         .filter_map(|conversation_view| {
-            let has_pending_tool_call = conversation_view
-                .read(cx)
-                .root_thread_has_pending_tool_call(cx);
+            let status = AgentPanel::conversation_status(conversation_view.read(cx), cx)?;
             let conversation_thread_id = conversation_view.read(cx).parent_id();
             let thread_view = conversation_view.read(cx).root_thread_view()?;
             let thread_view_ref = thread_view.read(cx);
@@ -8164,18 +8304,6 @@ fn all_thread_infos_for_workspace(
                 .is_some_and(|native_thread| native_thread.read(cx).is_generating_title());
             let session_id = thread.session_id().clone();
             let is_background = agent_panel.is_retained_thread(&conversation_thread_id);
-
-            let status = if has_pending_tool_call {
-                AgentThreadStatus::WaitingForConfirmation
-            } else if thread.had_error() {
-                AgentThreadStatus::Error
-            } else {
-                match thread.status() {
-                    ThreadStatus::Unconfirmed => AgentThreadStatus::Unconfirmed,
-                    ThreadStatus::Generating => AgentThreadStatus::Running,
-                    ThreadStatus::Idle => AgentThreadStatus::Completed,
-                }
-            };
 
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
 
