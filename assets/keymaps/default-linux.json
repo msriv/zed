@@ -775,6 +775,17 @@
     },
   },
   {
+    "context": "ThreadSwitcher > Editor",
+    "bindings": {
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "tab": "menu::SelectNext",
+      "shift-tab": "menu::SelectPrevious",
+      "enter": "menu::Confirm",
+      "escape": "menu::Cancel",
+    },
+  },
+  {
     "context": "Workspace && debugger_running",
     "bindings": {
       // Unbind `f5` to avoid dispatching the `debugger::Rerun` as that is what `f5` is bound to in the `Workspace`

@@ -65,6 +65,8 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
+    auto_expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
+    collapsed_tool_calls: HashSet<acp_v2::ToolCallId>,
     /// Subagent cards shown for an ACP parent's outgoing session messages.
     expanded_session_message_cards: HashSet<acp_v2::MessageId>,
 }
@@ -89,12 +91,16 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            auto_expanded_tool_calls: HashSet::default(),
+            collapsed_tool_calls: HashSet::default(),
             expanded_session_message_cards: HashSet::default(),
         }
     }
 
     pub(crate) fn is_tool_call_expanded(&self, tool_call_id: &acp_v2::ToolCallId) -> bool {
         self.expanded_tool_calls.contains(tool_call_id)
+            || (self.auto_expanded_tool_calls.contains(tool_call_id)
+                && !self.collapsed_tool_calls.contains(tool_call_id))
     }
 
     pub(crate) fn is_tool_call_content_visible(&self, tool_call: &ToolCall) -> bool {
@@ -102,16 +108,26 @@ impl EntryViewState {
     }
 
     pub(crate) fn expand_tool_call(&mut self, tool_call_id: acp_v2::ToolCallId) {
+        self.collapsed_tool_calls.remove(&tool_call_id);
         self.expanded_tool_calls.insert(tool_call_id);
+    }
+
+    pub(crate) fn expand_new_diff(&mut self, tool_call_id: acp_v2::ToolCallId) {
+        if !self.collapsed_tool_calls.contains(&tool_call_id) {
+            self.expanded_tool_calls.insert(tool_call_id);
+        }
     }
 
     pub(crate) fn collapse_tool_call(&mut self, tool_call_id: &acp_v2::ToolCallId) {
         self.expanded_tool_calls.remove(tool_call_id);
+        self.collapsed_tool_calls.insert(tool_call_id.clone());
     }
 
     pub(crate) fn toggle_tool_call_expansion(&mut self, tool_call_id: &acp_v2::ToolCallId) {
-        if !self.expanded_tool_calls.remove(tool_call_id) {
-            self.expanded_tool_calls.insert(tool_call_id.clone());
+        if self.is_tool_call_expanded(tool_call_id) {
+            self.collapse_tool_call(tool_call_id);
+        } else {
+            self.expand_tool_call(tool_call_id.clone());
         }
     }
 
@@ -382,6 +398,29 @@ impl EntryViewState {
             }
             AgentThreadEntry::ToolCall(tool_call) => {
                 let id = tool_call.id.clone();
+                let settings = AgentSettings::get_global(cx);
+                let auto_expand = if tool_call.terminals().next().is_some()
+                    || matches!(tool_call.kind(), acp_v2::ToolKind::Execute)
+                {
+                    settings.expand_terminal_card
+                } else if tool_call.diffs().next().is_some()
+                    || matches!(tool_call.kind(), acp_v2::ToolKind::Edit)
+                    || tool_call.content().iter().any(|content| {
+                        matches!(content, acp_thread::ToolCallContent::DiffPatch { .. })
+                    })
+                {
+                    settings.expand_edit_card
+                } else {
+                    true
+                };
+                if auto_expand
+                    && matches!(tool_call.status(), acp_thread::ToolCallStatus::InProgress)
+                    && !matches!(tool_call_sync, ToolCallSync::Restore)
+                {
+                    self.auto_expanded_tool_calls.insert(id.clone());
+                } else if !matches!(tool_call_sync, ToolCallSync::Materialize) {
+                    self.auto_expanded_tool_calls.remove(&id);
+                }
                 let materialize_content =
                     materialize_tool_calls || self.is_tool_call_content_visible(tool_call);
                 let terminals = tool_call.terminals().cloned().collect::<Vec<_>>();
@@ -411,6 +450,8 @@ impl EntryViewState {
                             index,
                             Entry::ToolCall(ToolCallEntry {
                                 content: HashMap::default(),
+                                terminal_output_scroll_handles: HashMap::default(),
+                                output_scroll_handle: ScrollHandle::default(),
                                 patch_hunk_ids: HashSet::default(),
                                 restored_view_ids: HashSet::default(),
                                 focus_handle: cx.focus_handle(),
@@ -423,6 +464,7 @@ impl EntryViewState {
                     };
                 let ToolCallEntry {
                     content: views,
+                    terminal_output_scroll_handles,
                     restored_view_ids,
                     ..
                 } = tool_call_entry;
@@ -436,6 +478,20 @@ impl EntryViewState {
                         let terminal_id = terminal.entity_id();
                         match views.entry(terminal_id) {
                             collections::hash_map::Entry::Vacant(entry) => {
+                                let scroll_handle = terminal_output_scroll_handles
+                                    .entry(terminal_id)
+                                    .or_default()
+                                    .clone();
+                                scroll_handle.scroll_to_bottom();
+                                let inner_terminal = terminal.read(cx).inner().clone();
+                                cx.observe(&inner_terminal, move |_, _, _| {
+                                    if -scroll_handle.offset().y
+                                        >= scroll_handle.max_offset().y - gpui::px(1.)
+                                    {
+                                        scroll_handle.scroll_to_bottom();
+                                    }
+                                })
+                                .detach();
                                 let element = create_terminal(
                                     self.workspace.clone(),
                                     self.project.clone(),
@@ -711,6 +767,8 @@ impl AssistantMessageEntry {
 #[derive(Debug)]
 pub struct ToolCallEntry {
     content: HashMap<EntityId, AnyEntity>,
+    terminal_output_scroll_handles: HashMap<EntityId, ScrollHandle>,
+    output_scroll_handle: ScrollHandle,
     patch_hunk_ids: HashSet<EntityId>,
     restored_view_ids: HashSet<EntityId>,
     focus_handle: FocusHandle,
@@ -768,6 +826,26 @@ impl Entry {
             .get(&buffer.entity_id())
             .cloned()
             .and_then(|entity| entity.downcast::<Editor>().ok())
+    }
+
+    pub fn tool_output_scroll_handle(&self) -> Option<ScrollHandle> {
+        let Self::ToolCall(entry) = self else {
+            return None;
+        };
+        Some(entry.output_scroll_handle.clone())
+    }
+
+    pub fn terminal_output_scroll_handle(
+        &self,
+        terminal: &Entity<acp_thread::Terminal>,
+    ) -> Option<ScrollHandle> {
+        let Self::ToolCall(entry) = self else {
+            return None;
+        };
+        entry
+            .terminal_output_scroll_handles
+            .get(&terminal.entity_id())
+            .cloned()
     }
 
     pub fn terminal(
@@ -933,6 +1011,7 @@ mod tests {
 
     use acp_thread::{AgentConnection, StubAgentConnection};
     use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp_v2};
+    use agent_settings::AgentSettings;
     use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
     use editor::RowInfo;
     use fs::FakeFs;
@@ -945,7 +1024,7 @@ mod tests {
     use pretty_assertions::assert_matches;
     use project::Project;
     use serde_json::json;
-    use settings::SettingsStore;
+    use settings::{Settings as _, SettingsStore};
     use util::path;
     use workspace::{MultiWorkspace, PathList};
 
@@ -964,6 +1043,121 @@ mod tests {
         assert_eq!(reindex_after_removal(5, &(2..4)), Some(3));
         // An empty removal range leaves indices untouched.
         assert_eq!(reindex_after_removal(3, &(2..2)), Some(3));
+    }
+
+    #[gpui::test]
+    async fn running_tools_follow_status_until_the_user_overrides_them(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|_, cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/project"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let state = cx.new(|_| {
+            EntryViewState::new(
+                workspace.downgrade(),
+                project.downgrade(),
+                None,
+                Arc::new(RwLock::new(SessionCapabilities::default())),
+                "Test Agent".into(),
+            )
+        });
+        let id = acp_v2::ToolCallId::new("tool");
+        for (status, explicitly_open, expected_open) in [
+            (acp_v1::ToolCallStatus::InProgress, None, true),
+            (acp_v1::ToolCallStatus::InProgress, Some(false), false),
+            (acp_v1::ToolCallStatus::InProgress, None, false),
+            (acp_v1::ToolCallStatus::Completed, None, false),
+            (acp_v1::ToolCallStatus::Completed, Some(true), true),
+            (acp_v1::ToolCallStatus::InProgress, None, true),
+            (acp_v1::ToolCallStatus::Completed, None, true),
+        ] {
+            cx.update(|_, cx| {
+                connection.send_update(
+                    session_id.clone(),
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new("tool", "Inspect project").status(status),
+                    ),
+                    cx,
+                )
+            });
+            state.update_in(cx, |state, window, cx| {
+                state.sync_entry(0, &thread, window, cx);
+                if let Some(open) = explicitly_open {
+                    if open {
+                        state.expand_tool_call(id.clone());
+                    } else {
+                        state.collapse_tool_call(&id);
+                    }
+                }
+                assert_eq!(state.is_tool_call_expanded(&id), expected_open);
+                let acp_thread::AgentThreadEntry::ToolCall(tool_call) =
+                    &thread.read(cx).entries()[0]
+                else {
+                    panic!("expected tool call")
+                };
+                assert_eq!(state.is_tool_call_content_visible(tool_call), expected_open);
+            });
+        }
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    expand_terminal_card: false,
+                    expand_edit_card: false,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        for (entry_ix, kind) in [(1, acp_v1::ToolKind::Execute), (2, acp_v1::ToolKind::Edit)] {
+            let id = acp_v2::ToolCallId::new(format!("collapsed-{entry_ix}"));
+            cx.update(|_, cx| {
+                connection.send_update(
+                    session_id.clone(),
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new(
+                            acp_v1::ToolCallId::new(id.0.clone()),
+                            "Inspect project",
+                        )
+                        .kind(kind)
+                        .status(acp_v1::ToolCallStatus::InProgress),
+                    ),
+                    cx,
+                )
+            });
+            state.update_in(cx, |state, window, cx| {
+                state.sync_entry(entry_ix, &thread, window, cx);
+                assert!(
+                    !state.is_tool_call_expanded(&id),
+                    "disabled category must stay collapsed while running"
+                );
+                state.toggle_tool_call_expansion(&id);
+                state.sync_entry(entry_ix, &thread, window, cx);
+                assert!(
+                    state.is_tool_call_expanded(&id),
+                    "explicit expansion overrides the preference"
+                );
+                state.collapse_tool_call(&id);
+                state.expand_new_diff(id.clone());
+                assert!(
+                    !state.is_tool_call_expanded(&id),
+                    "new diff views must not override an explicit collapse"
+                );
+            });
+        }
     }
 
     #[gpui::test]
@@ -1186,6 +1380,7 @@ mod tests {
         cx.update(|cx| {
             let mut settings_store = SettingsStore::test(cx);
             settings_store.register_setting::<feature_flags::FeatureFlagsSettings>();
+            settings_store.register_setting::<AgentSettings>();
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);

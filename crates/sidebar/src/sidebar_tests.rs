@@ -3557,6 +3557,249 @@ async fn test_agent_panel_terminal_notifications_update_sidebar(cx: &mut TestApp
 }
 
 #[gpui::test]
+async fn test_thread_picker_opens_empty_and_single_entry_without_preview(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.close_sidebar(window, cx);
+    });
+    cx.dispatch_action(OpenThreadPicker);
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, cx| {
+        let picker = sidebar
+            .thread_switcher
+            .as_ref()
+            .expect("empty picker opens");
+        assert!(picker.read(cx).is_picker());
+        assert!(picker.read(cx).entries().is_empty());
+    });
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert!(!multi_workspace.sidebar_open())
+    });
+    cx.dispatch_action(menu::Cancel);
+    cx.run_until_parked();
+
+    let terminal_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Build", true, window, cx)
+        })
+        .expect("test terminal");
+    cx.run_until_parked();
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.open_thread_picker_impl(window, cx);
+    });
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, cx| {
+        let picker = sidebar
+            .thread_switcher
+            .as_ref()
+            .expect("single entry picker opens");
+        assert_eq!(picker.read(cx).entries().len(), 1);
+        assert_eq!(
+            picker
+                .read(cx)
+                .selected_entry()
+                .and_then(|entry| entry.terminal_id()),
+            Some(terminal_id)
+        );
+    });
+    cx.dispatch_action(menu::Confirm);
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert!(sidebar.thread_switcher.is_none())
+    });
+    panel.read_with(cx, |panel, _cx| {
+        assert_eq!(panel.active_terminal_id(), Some(terminal_id))
+    });
+}
+
+#[gpui::test]
+async fn test_thread_picker_search_cancel_and_confirm(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let build = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Build", true, window, cx)
+        })
+        .expect("build terminal");
+    let server = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Server", true, window, cx)
+        })
+        .expect("server terminal");
+    let workspace = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.focus_panel::<AgentPanel>(window, cx);
+    });
+    cx.run_until_parked();
+    let original_focus = cx.update(|window, cx| window.focused(cx));
+    cx.update(|window, cx| {
+        assert!(
+            panel.focus_handle(cx).contains_focused(window, cx),
+            "original focus must belong to the rendered Agent Panel"
+        );
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.open_thread_picker_impl(window, cx)
+    });
+    cx.run_until_parked();
+    let picker = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar.thread_switcher.clone().expect("picker")
+    });
+    panel.update(cx, |panel, cx| panel.emit_test_terminal_bell(build, cx));
+    cx.run_until_parked();
+    picker.read_with(cx, |picker, _cx| {
+        assert_eq!(
+            picker
+                .entries()
+                .first()
+                .and_then(|entry| entry.terminal_id()),
+            Some(build),
+            "Needs You sorts first"
+        );
+        assert_eq!(
+            picker
+                .selected_entry()
+                .and_then(|entry| entry.terminal_id()),
+            Some(server),
+            "status reorder preserves identity"
+        );
+    });
+    picker.update_in(cx, |picker, window, cx| {
+        picker.set_query("build", window, cx)
+    });
+    cx.run_until_parked();
+    picker.read_with(cx, |picker, _cx| {
+        assert_eq!(picker.entries().len(), 1);
+        assert_eq!(
+            picker
+                .selected_entry()
+                .and_then(|entry| entry.terminal_id()),
+            Some(build)
+        );
+    });
+    panel.read_with(cx, |panel, _cx| {
+        assert_eq!(
+            panel.active_terminal_id(),
+            Some(server),
+            "search must not preview"
+        )
+    });
+    cx.dispatch_action(menu::Cancel);
+    cx.run_until_parked();
+    cx.update(|window, cx| assert_eq!(window.focused(cx), original_focus));
+    panel.read_with(cx, |panel, _cx| {
+        assert_eq!(panel.active_terminal_id(), Some(server))
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.open_thread_picker_impl(window, cx)
+    });
+    cx.run_until_parked();
+    let picker = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar.thread_switcher.clone().expect("picker")
+    });
+    picker.update_in(cx, |picker, window, cx| {
+        picker.set_query("build", window, cx)
+    });
+    cx.run_until_parked();
+    cx.dispatch_action(menu::Confirm);
+    cx.run_until_parked();
+    panel.read_with(cx, |panel, _cx| {
+        assert_eq!(panel.active_terminal_id(), Some(build))
+    });
+}
+
+#[gpui::test]
+async fn test_thread_picker_scope_ignores_sidebar_filter_and_collapsed_groups(
+    cx: &mut TestAppContext,
+) {
+    let project_a = init_test_project_with_agent_panel("/project-a", cx).await;
+    let other_fs = FakeFs::new(cx.executor());
+    other_fs
+        .insert_tree("/project-b", serde_json::json!({"src": {}}))
+        .await;
+    let project_b = project::Project::test(other_fs, ["/project-b".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let (sidebar, panel_a) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let workspace_a = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    let build = panel_a
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Build", true, window, cx)
+        })
+        .expect("build terminal");
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx)
+    });
+    let panel_b = add_agent_panel(&workspace_b, cx);
+    let deploy = panel_b
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Deploy", true, window, cx)
+        })
+        .expect("deploy terminal");
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.activate(workspace_a.clone(), None, window, cx)
+    });
+    cx.run_until_parked();
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        let key = sidebar
+            .active_project_group_key(cx)
+            .expect("active project");
+        sidebar.set_group_expanded(&key, false, cx);
+        sidebar
+            .filter_editor
+            .update(cx, |editor, cx| editor.set_text("missing", window, cx));
+    });
+    cx.run_until_parked();
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.open_thread_picker_impl(window, cx)
+    });
+    cx.run_until_parked();
+    let picker = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar.thread_switcher.clone().expect("picker")
+    });
+    picker.read_with(cx, |picker, _cx| {
+        assert_eq!(picker.entries().len(), 1);
+        assert_eq!(
+            picker
+                .selected_entry()
+                .and_then(|entry| entry.terminal_id()),
+            Some(build)
+        );
+    });
+    picker.update_in(cx, |picker, window, cx| picker.toggle_scope(window, cx));
+    picker.read_with(cx, |picker, _cx| assert_eq!(picker.entries().len(), 2));
+    picker.update_in(cx, |picker, window, cx| {
+        picker.set_query("project-b", window, cx)
+    });
+    cx.run_until_parked();
+    picker.read_with(cx, |picker, _cx| {
+        assert_eq!(picker.entries().len(), 1);
+        assert_eq!(
+            picker
+                .selected_entry()
+                .and_then(|entry| entry.terminal_id()),
+            Some(deploy)
+        );
+    });
+    cx.dispatch_action(menu::Cancel);
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(multi_workspace.workspace(), &workspace_a)
+    });
+}
+
+#[gpui::test]
 async fn test_thread_switcher_can_activate_agent_panel_terminal(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =

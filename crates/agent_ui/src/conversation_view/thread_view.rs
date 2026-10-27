@@ -880,6 +880,25 @@ enum ToolCallLayout {
     Floating,
 }
 
+fn tool_call_is_visible(tool_call: &ToolCall, cx: &App) -> bool {
+    !matches!(tool_call.status(), ToolCallStatus::Canceled)
+        || tool_call.authorization_id().is_some()
+        || tool_call.content().iter().any(|content| match content {
+            ToolCallContent::ContentBlock { block, .. } => block.visible_content(cx),
+            ToolCallContent::Diff(_)
+            | ToolCallContent::LegacyDiff { .. }
+            | ToolCallContent::Terminal { .. } => true,
+            ToolCallContent::DiffPatch { render, .. } => {
+                !render.files.is_empty()
+                    || render
+                        .fallback
+                        .as_ref()
+                        .is_some_and(|markdown| !markdown.read(cx).source().is_empty())
+            }
+            ToolCallContent::Other { markdown, .. } => !markdown.read(cx).source().is_empty(),
+        })
+}
+
 impl ToolCallLayout {
     /// Stable discriminant used to disambiguate element ids when the same tool
     /// call is rendered in more than one layout at once (e.g. inline in the
@@ -1600,23 +1619,13 @@ impl ThreadView {
         match &event.view_event {
             ViewEvent::NewDiff(tool_call_id) => {
                 if AgentSettings::get_global(cx).expand_edit_card {
-                    self.entry_view_state.update(cx, |state, _cx| {
-                        state.expand_tool_call(tool_call_id.clone());
+                    self.entry_view_state.update(cx, |state, _| {
+                        state.expand_new_diff(tool_call_id.clone());
                     });
                 }
             }
-            ViewEvent::NewTerminal(tool_call_id) => {
-                if AgentSettings::get_global(cx).expand_terminal_card {
-                    self.entry_view_state.update(cx, |state, _cx| {
-                        state.expand_tool_call(tool_call_id.clone());
-                    });
-                }
-            }
-            ViewEvent::TerminalMovedToBackground(tool_call_id) => {
-                self.entry_view_state.update(cx, |state, _cx| {
-                    state.collapse_tool_call(tool_call_id);
-                });
-            }
+            // Terminal output expands transiently; only the user's disclosure choice pins it open.
+            ViewEvent::NewTerminal(_) | ViewEvent::TerminalMovedToBackground(_) => {}
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::Focus) => {
                 if self.can_edit_user_message(event.entry_index, cx) {
                     self.editing_message = Some(event.entry_index);
@@ -3174,9 +3183,6 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.has_visible_conversation(cx) {
-            return;
-        }
         self.set_editor_is_expanded(!self.editor_expanded, cx);
         cx.stop_propagation();
         cx.notify();
@@ -3782,6 +3788,10 @@ impl ThreadView {
     }
 
     // thread stuff
+
+    pub(crate) fn has_thread_error(&self) -> bool {
+        self.thread_error.is_some()
+    }
 
     pub fn clear_thread_error(&mut self, cx: &mut Context<Self>) {
         self.thread_error = None;
@@ -5385,7 +5395,7 @@ impl ThreadView {
 
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let has_messages = self.has_visible_conversation(cx);
-        let fills_container = !has_messages || editor_expanded;
+        let fills_container = editor_expanded;
         let composer_is_read_only = self.message_editor.read(cx).editor().read(cx).read_only(cx);
         let discard_draft_button = composer_is_read_only.then(|| {
             div()
@@ -5405,27 +5415,32 @@ impl ThreadView {
         });
 
         h_flex()
+            .px_2()
             .py_2()
-            .bg(editor_bg_color)
+            .bg(cx.theme().colors().panel_background)
             .justify_center()
             .on_action(cx.listener(Self::handle_message_editor_move_up))
-            .map(|this| {
-                if has_messages {
-                    this.on_action(cx.listener(Self::expand_message_editor))
-                        .border_t_1()
-                        .border_color(cx.theme().colors().border)
-                        .when(editor_expanded, |this| this.h(vh(0.8, window)))
-                } else {
-                    this.flex_1().size_full()
-                }
+            .flex_shrink_1()
+            .flex_grow_0()
+            .min_h_0()
+            .w_full()
+            .on_action(cx.listener(Self::expand_message_editor))
+            .when(has_messages, |this| {
+                this.border_t_1().border_color(cx.theme().colors().border)
             })
+            .when(editor_expanded, |this| this.h(vh(0.8, window)))
             .child(
                 v_flex()
                     .when_some(max_content_width, |this, max_w| this.flex_basis(max_w))
                     .when(max_content_width.is_none(), |this| this.w_full())
                     .min_w_0()
                     .when(fills_container, |this| this.h_full())
-                    .px_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(editor_bg_color)
                     .flex_shrink_1()
                     .flex_grow_0()
                     .justify_between()
@@ -5439,7 +5454,7 @@ impl ThreadView {
                             .pt_1()
                             .pr_2p5()
                             .child(self.message_editor.clone())
-                            .when(has_messages, |this| {
+                            .map(|this| {
                                 this.child(
                                     h_flex()
                                         .absolute()
@@ -7300,17 +7315,20 @@ impl ThreadView {
                         }
                     })
                     .pb_3()
-                    .px_2()
+                    .px_5()
                     .gap_1p5()
                     .w_full()
+                    .items_end()
                     .child(
                         div()
                             .relative()
+                            .w_full()
+                            .max_w(relative(0.88))
                             .child(
                                 div()
-                                    .py_3()
-                                    .px_2()
-                                    .rounded_md()
+                                    .py_2()
+                                    .px_3()
+                                    .rounded_lg()
                                     .bg(cx.theme().colors().editor_background)
                                     .border_1()
                                     .when(is_indented, |this| {
@@ -7332,8 +7350,7 @@ impl ThreadView {
                                         if editing && !editor_focus {
                                             return this.border_dashed()
                                         }
-                                        this.when(opaque_window, |this| this.shadow_md())
-                                            .hover(|s| {
+                                        this.hover(|s| {
                                                 s.border_color(focus_border.opacity(0.8))
                                             })
                                     })
@@ -7487,42 +7504,126 @@ impl ThreadView {
                 }
             }
             AgentThreadEntry::ToolCall(tool_call) => {
-                // A canceled tool call that produced visible output is still worth
-                // showing, but one that was canceled before producing anything just
-                // renders as a useless "Canceled" card — hide those entirely.
-                if matches!(tool_call.status(), ToolCallStatus::Canceled) {
-                    let has_visible_content =
-                        tool_call.content().iter().any(|content| match content {
-                            ToolCallContent::ContentBlock { block, .. } => {
-                                block.visible_content(cx)
-                            }
-                            ToolCallContent::Diff(_)
-                            | ToolCallContent::LegacyDiff { .. }
-                            | ToolCallContent::Terminal { .. } => true,
-                            ToolCallContent::DiffPatch { render, .. } => {
-                                !render.files.is_empty()
-                                    || render.fallback.as_ref().is_some_and(|markdown| {
-                                        !markdown.read(cx).source().is_empty()
-                                    })
-                            }
-                            ToolCallContent::Other { markdown, .. } => {
-                                !markdown.read(cx).source().is_empty()
-                            }
-                        });
-                    if !has_visible_content {
-                        return Empty.into_any();
-                    }
+                if !tool_call_is_visible(tool_call, cx) {
+                    return Empty.into_any();
                 }
 
+                let entries = self.thread.read(cx).entries();
+                let starts_group = !entries.iter().take(entry_ix).rev()
+                    .take_while(|entry| matches!(entry, AgentThreadEntry::ToolCall(_)))
+                    .any(|entry| matches!(entry, AgentThreadEntry::ToolCall(tool) if tool_call_is_visible(tool, cx)));
+                let ends_group = !entries.iter().skip(entry_ix + 1)
+                    .take_while(|entry| matches!(entry, AgentThreadEntry::ToolCall(_)))
+                    .any(|entry| matches!(entry, AgentThreadEntry::ToolCall(tool) if tool_call_is_visible(tool, cx)));
+                let header = starts_group.then(|| {
+                    let tools = entries
+                        .iter()
+                        .skip(entry_ix)
+                        .take_while(|entry| matches!(entry, AgentThreadEntry::ToolCall(_)))
+                        .filter_map(|entry| match entry {
+                            AgentThreadEntry::ToolCall(tool) if tool_call_is_visible(tool, cx) => {
+                                Some(tool)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let running = tools
+                        .iter()
+                        .filter(|tool| matches!(tool.status(), ToolCallStatus::InProgress))
+                        .count();
+                    let needs_action = tools.iter().any(|tool| {
+                        tool.authorization_id().is_some()
+                            || matches!(tool.status(), ToolCallStatus::WaitingForConfirmation)
+                    });
+                    let completed = tools
+                        .iter()
+                        .filter(|tool| matches!(tool.status(), ToolCallStatus::Completed))
+                        .count();
+                    let summary = if needs_action {
+                        "Needs approval".to_owned()
+                    } else if running > 0 {
+                        format!("{running} running · {} tools", tools.len())
+                    } else {
+                        format!("{completed}/{} completed", tools.len())
+                    };
+                    let working_dir = tools.iter().find_map(|tool| {
+                        tool.terminals().find_map(|terminal| {
+                            terminal
+                                .read(cx)
+                                .working_dir()
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                        })
+                    });
+                    h_flex()
+                        .debug_selector(move || format!("tool-activity-group-header-{entry_ix}"))
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .justify_between()
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::Folder)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(
+                                        working_dir.unwrap_or_else(|| "Tool activity".to_owned()),
+                                    )
+                                    .buffer_font(cx)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .truncate_start(),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .debug_selector({
+                                    let selector =
+                                        format!("tool-activity-summary-{entry_ix}-{summary}");
+                                    move || selector.clone()
+                                })
+                                .child(Label::new(summary).size(LabelSize::XSmall).color(
+                                    if needs_action {
+                                        Color::Warning
+                                    } else {
+                                        Color::Muted
+                                    },
+                                )),
+                        )
+                });
                 let tool_call = self.render_any_tool_call(
                     self.thread.read(cx).session_id(),
                     entry_ix,
                     tool_call,
                     &self.focus_handle(cx),
-                    ToolCallLayout::Standalone,
+                    ToolCallLayout::Embedded,
                     window,
                     cx,
                 );
+                let tool_call = div()
+                    .debug_selector(move || {
+                        format!("tool-activity-row-{entry_ix}-{starts_group}-{ends_group}")
+                    })
+                    .mx_5()
+                    .border_x_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().editor_background)
+                    .when(starts_group, |this| this.mt_2().border_t_1().rounded_t_md())
+                    .when(ends_group, |this| this.mb_3().border_b_1().rounded_b_md())
+                    .overflow_hidden()
+                    .children(header)
+                    .child(
+                        div()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border.opacity(0.6))
+                            .child(tool_call),
+                    );
 
                 if let Some(handle) = self
                     .entry_view_state
@@ -8394,24 +8495,11 @@ impl ThreadView {
     }
 
     pub(crate) fn sync_editor_mode(&mut self, cx: &mut Context<Self>) {
-        let has_messages = self.has_visible_conversation(cx);
-        let v2_empty_state = !has_messages;
-
-        if !has_messages {
-            self.editor_expanded = false;
-        }
-
         let mode = if self.editor_expanded {
             EditorMode::Full {
                 scale_ui_elements_with_buffer_font_size: false,
                 show_active_line_background: false,
                 sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
-            }
-        } else if v2_empty_state {
-            EditorMode::Full {
-                scale_ui_elements_with_buffer_font_size: false,
-                show_active_line_background: false,
-                sizing_behavior: SizingBehavior::Default,
             }
         } else {
             EditorMode::AutoHeight {
@@ -9152,7 +9240,7 @@ impl ThreadView {
         let command_element = self.render_collapsible_command(
             header_group.clone(),
             false,
-            tool_call.label.clone(),
+            terminal_data.command().clone(),
             window,
             cx,
         );
@@ -9160,7 +9248,8 @@ impl ThreadView {
         let is_expanded = self
             .entry_view_state
             .read(cx)
-            .is_tool_call_expanded(&tool_call.id);
+            .is_tool_call_content_visible(tool_call)
+            || needs_confirmation;
 
         let truncated_tooltip = truncated_output.then(|| {
             if let Some(output) = output {
@@ -9189,6 +9278,18 @@ impl ThreadView {
             working_dir,
             is_expanded,
         )
+        .summary(
+            tool_call
+                .label
+                .read(cx)
+                .source()
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.starts_with("```") && !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+        .completed(command_finished && !tool_failed && !command_failed)
         .elapsed(time_elapsed)
         .running(!command_finished && !needs_confirmation)
         .on_toggle_expand(cx.listener({
@@ -9224,13 +9325,18 @@ impl ThreadView {
         .when_some(tool_call.sandbox_not_applied.as_ref(), |header, reason| {
             header.sandbox_warning(self.sandbox_not_applied_warning(reason, cx))
         })
-        .command_slot(command_element);
+        .when(is_expanded, |header| header.command_slot(command_element));
 
         let terminal_view = self
             .entry_view_state
             .read(cx)
             .entry(entry_ix)
             .and_then(|entry| entry.terminal(terminal));
+        let terminal_output_scroll_handle = self
+            .entry_view_state
+            .read(cx)
+            .entry(entry_ix)
+            .and_then(|entry| entry.terminal_output_scroll_handle(terminal));
 
         v_flex()
             .when(layout == ToolCallLayout::Standalone, |this| {
@@ -9259,11 +9365,25 @@ impl ThreadView {
                                 .is_scrollable()
                             {
                                 div()
-                                    .h(rems(18. + TERMINAL_CONTENT_TOP_PADDING))
+                                    .h(rems(10. + TERMINAL_CONTENT_TOP_PADDING))
                                     .child(terminal_view)
                                     .into_any_element()
                             } else {
-                                terminal_view.into_any_element()
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "terminal-output-{}",
+                                        terminal.entity_id()
+                                    )))
+                                    .max_h(rems(12. + TERMINAL_CONTENT_TOP_PADDING))
+                                    .overflow_y_scroll()
+                                    .when_some(terminal_output_scroll_handle, |this, handle| {
+                                        if -handle.offset().y >= handle.max_offset().y - px(1.) {
+                                            handle.scroll_to_bottom();
+                                        }
+                                        this.track_scroll(&handle)
+                                    })
+                                    .child(terminal_view)
+                                    .into_any_element()
                             };
 
                             div()
@@ -9494,7 +9614,7 @@ impl ThreadView {
             })
             .unwrap_or((false, focus_handle.clone()));
 
-        let use_card_layout = needs_confirmation || is_edit || is_terminal_tool;
+        let use_card_layout = true;
 
         let has_image_content = tool_call.content().iter().any(|c| c.image().is_some());
 
@@ -9744,9 +9864,14 @@ impl ThreadView {
             None
         };
 
+        let output_scroll_handle = self
+            .entry_view_state
+            .read(cx)
+            .entry(entry_ix)
+            .and_then(|entry| entry.tool_output_scroll_handle());
         let body = v_flex()
             .map(|this| {
-                if is_terminal_tool {
+                if is_terminal_tool && needs_confirmation {
                     this.child(self.render_collapsible_command(
                         card_header_id.clone(),
                         true,
@@ -9762,7 +9887,7 @@ impl ThreadView {
                             .w_full()
                             .justify_between()
                             .when(use_card_layout, |this| {
-                                this.p_0p5()
+                                this.px_2().py_2()
                                     .rounded_t(rems_from_px(5_f32))
                                     .bg(self.tool_card_header_bg(cx))
                             })
@@ -9799,7 +9924,6 @@ impl ThreadView {
                                                         )
                                                         .opened_icon(IconName::ChevronUp)
                                                         .closed_icon(IconName::ChevronDown)
-                                                        .visible_on_hover(&card_header_id)
                                                         .on_click(cx.listener({
                                                             let id = tool_call.id.clone();
                                                             move |this: &mut Self,
@@ -9908,14 +10032,36 @@ impl ThreadView {
                     )
                 }
             })
-            .children(tool_output_display);
+            .when(is_terminal_tool && is_open && !needs_confirmation, |this| {
+                this.child(self.render_collapsible_command(
+                    card_header_id.clone(),
+                    false,
+                    tool_call.label.clone(),
+                    window,
+                    cx,
+                ))
+            })
+            .children(tool_output_display.map(|output| {
+                div()
+                    .id(("tool-activity-output", entry_ix))
+                    .when(!needs_confirmation && !is_edit, |this| {
+                        this.max_h(rems(16.)).overflow_y_scroll()
+                            .when_some(output_scroll_handle, |this, handle| {
+                                if -handle.offset().y >= handle.max_offset().y - px(1.) {
+                                    handle.scroll_to_bottom();
+                                }
+                                this.track_scroll(&handle)
+                            })
+                    })
+                    .child(output)
+            }));
 
         v_flex()
             .map(|this| {
                 if matches!(layout, ToolCallLayout::Embedded | ToolCallLayout::Floating) {
                     this
                 } else if use_card_layout {
-                    this.my_1p5()
+                    this.my_1()
                         .rounded_md()
                         .border_1()
                         .when(failed_or_canceled, |this| this.border_dashed())
@@ -11289,7 +11435,27 @@ impl ThreadView {
         };
 
         let interrupted_edit = is_file && has_failed && has_diff_changes;
-        let tool_icon = if interrupted_edit {
+        let tool_icon = if matches!(tool_call.status(), ToolCallStatus::InProgress) {
+            Icon::new(IconName::LoadCircle)
+                .size(IconSize::Small)
+                .color(Color::Accent)
+                .with_rotate_animation(2)
+                .into_any_element()
+        } else if matches!(tool_call.status(), ToolCallStatus::Completed) {
+            Icon::new(IconName::Check)
+                .size(IconSize::Small)
+                .color(Color::Success)
+                .into_any_element()
+        } else if matches!(
+            tool_call.status(),
+            ToolCallStatus::Failed | ToolCallStatus::Rejected | ToolCallStatus::Canceled
+        ) && !interrupted_edit
+        {
+            Icon::new(IconName::Close)
+                .size(IconSize::Small)
+                .color(Color::Error)
+                .into_any_element()
+        } else if interrupted_edit {
             div()
                 .child(DecoratedIcon::new(
                     file_icon,
@@ -11415,11 +11581,32 @@ impl ThreadView {
             } else {
                 h_flex()
                     .w_full()
-                    .child(self.render_markdown(
-                        tool_call.label.clone(),
-                        MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx),
-                        cx,
-                    ))
+                    .min_w_0()
+                    .map(|this| {
+                        if matches!(tool_call.kind(), acp_v2::ToolKind::Execute) {
+                            this.child(
+                                Label::new(
+                                    tool_call
+                                        .label
+                                        .read(cx)
+                                        .source()
+                                        .lines()
+                                        .map(str::trim)
+                                        .filter(|line| !line.starts_with("```") && !line.is_empty())
+                                        .collect::<Vec<_>>()
+                                        .join(" "),
+                                )
+                                .size(LabelSize::Small)
+                                .truncate(),
+                            )
+                        } else {
+                            this.child(self.render_markdown(
+                                tool_call.label.clone(),
+                                MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                cx,
+                            ))
+                        }
+                    })
                     .into_any()
             })
             .when(!is_edit, |this| this.child(gradient_overlay))
@@ -13607,6 +13794,8 @@ impl Render for ThreadView {
         let list_state = self.list_state.clone();
 
         let conversation = v_flex()
+            .flex_1()
+            .min_h_0()
             .when(self.resumed_without_history, |this| {
                 this.child(Self::render_resume_notice(cx))
             })

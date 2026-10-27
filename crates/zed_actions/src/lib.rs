@@ -939,6 +939,8 @@ pub mod agents_sidebar {
     actions!(
         agents_sidebar,
         [
+            /// Searches conversations in the current project or all projects.
+            OpenThreadPicker,
             /// Moves focus to the sidebar's search/filter editor.
             FocusSidebarFilter,
         ]

@@ -34,6 +34,11 @@
 //!
 //!   UPDATE_BASELINE - Set to update baseline images instead of comparing
 //!   VISUAL_TEST_OUTPUT_DIR - Directory to save test output (default: target/visual_tests)
+//!   VISUAL_TEST_FILTER - Set to agent_conversation_redesign to capture only that fixture
+
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+#[path = "zed/agent_conversation_visual_fixture.rs"]
+mod agent_conversation_visual_fixture;
 
 // Stub main for non-macOS platforms
 #[cfg(not(target_os = "macos"))]
@@ -246,6 +251,12 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
 
     // Run until all initialization tasks complete
     cx.run_until_parked();
+
+    #[cfg(feature = "visual-tests")]
+    if std::env::var("VISUAL_TEST_FILTER").as_deref() == Ok("agent_conversation_redesign") {
+        agent_conversation_visual_fixture::run(app_state, &mut cx, update_baseline)?;
+        return Ok(());
+    }
 
     // Open workspace window
     let window_size = size(px(1280.0), px(800.0));
