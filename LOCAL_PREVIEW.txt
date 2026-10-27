@@ -86,3 +86,17 @@ The runner requires macOS window-server access. To intentionally refresh the
 local ignored baselines, add UPDATE_BASELINE=1 after reviewing the layout.
 
 Detailed temporary validation logs are under /private/tmp/zed-*.log.
+
+Appearance preset
+
+LOCAL_APPEARANCE.json preserves the frosted light/dark theme overrides, UI,
+editor and terminal fonts, and panel layout used by the local Zed installation.
+These are user settings, separate from the compiled Agent Panel redesign.
+To reproduce the appearance, open Zed's user settings and merge the preset's
+top-level keys into the existing object. Back up your settings first; do not
+replace the whole file, since other preferences and integrations live there.
+The preset is not automatically loaded by building this fork.
+
+The fonts .SystemUIFont and SFMono-Regular are macOS-specific; other platforms
+may need installed equivalents. Font binaries are not included. Frosted blur
+depends on platform support and operating-system transparency settings.
