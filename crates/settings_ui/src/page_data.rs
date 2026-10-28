@@ -77,6 +77,7 @@ pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
         version_control_page(),
         collaboration_page(),
         ai_page(cx),
+        twg_page(),
         network_page(),
         developer_page(cx),
     ]
@@ -11506,5 +11507,65 @@ mod tests {
         write_vim_mode_inner(&mut settings, Some(true));
         assert_eq!(settings.vim_mode, Some(true));
         assert_eq!(settings.helix_mode, Some(false));
+    }
+}
+
+fn twg_page() -> SettingsPage {
+    SettingsPage {
+        title: "TWG",
+        items: vec![
+            SettingsPageItem::SectionHeader("Connection"),
+            SettingsPageItem::TwgConnection,
+            SettingsPageItem::SectionHeader("CLI"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "TWG Path",
+                description: "Path to the TWG executable. Leave empty to discover TWG automatically. Confirm edits before checking the executable.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("twg.executable"),
+                    pick: |content| content.twg.as_ref()?.executable.as_ref(),
+                    write: |content, value, _| content.twg.get_or_insert_default().executable = value,
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SectionHeader("Account and Site"),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Site",
+                description: "Atlassian site required for Work panel ticket requests, such as example.atlassian.net. Test connection checks the active login.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("twg.site"),
+                    pick: |content| content.twg.as_ref()?.site.as_ref(),
+                    write: |content, value, _| content.twg.get_or_insert_default().site = value,
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Default Project",
+                description: "Default Jira project key used by the Work panel.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("twg.default_project"),
+                    pick: |content| content.twg.as_ref()?.default_project.as_ref(),
+                    write: |content, value, _| content.twg.get_or_insert_default().default_project = value,
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Auto Refresh",
+                description: "Minutes between Work panel refreshes. Set to zero to disable automatic refresh.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("twg.refresh_interval_minutes"),
+                    pick: |content| content.twg.as_ref()?.refresh_interval_minutes.as_ref(),
+                    write: |content, value, _| content.twg.get_or_insert_default().refresh_interval_minutes = value,
+                }),
+                metadata: None,
+                files: USER,
+            }),
+        ].into_boxed_slice(),
     }
 }

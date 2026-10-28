@@ -29,6 +29,7 @@ test-support = [
     "title_bar/test-support",
 ]
 visual-tests = [
+    "work_panel/test-support",
     "gpui/test-support",
     "gpui_platform/screen-capture",
     "gpui_platform/test-support",
@@ -228,6 +229,8 @@ watch.workspace = true
 web_search.workspace = true
 web_search_providers.workspace = true
 which_key.workspace = true
+twg.workspace = true
+work_panel.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 zed_credentials_provider.workspace = true

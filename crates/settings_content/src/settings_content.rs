@@ -11,6 +11,7 @@ mod serde_helper;
 mod terminal;
 mod theme;
 mod title_bar;
+mod twg;
 mod workspace;
 
 pub use action::{ActionName, ActionWithArguments, CommandAliasTarget};
@@ -31,6 +32,7 @@ use settings_json::parse_json_with_comments;
 pub use terminal::*;
 pub use theme::*;
 pub use title_bar::*;
+pub use twg::*;
 pub use workspace::*;
 
 use collections::{HashMap, IndexMap, IndexSet};
@@ -172,6 +174,12 @@ pub enum ReduceMotionMode {
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Default, Clone, Serialize, JsonSchema, MergeFrom)]
 pub struct SettingsContent {
+    /// TWG CLI connection and Work panel refresh settings.
+    pub twg: Option<TwgSettingsContent>,
+
+    /// Settings for the Work panel.
+    pub work_panel: Option<WorkPanelSettingsContent>,
+
     #[serde(flatten)]
     pub project: ProjectSettingsContent,
 
@@ -412,7 +420,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         journal, log, line_indicator_format, language_models, copilot, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
-        instrumentation,
+        instrumentation, twg, work_panel,
     },
     defaults: {},
 });
@@ -1687,5 +1695,29 @@ impl std::str::FromStr for DelayMs {
             .parse::<u64>()
             .map(DelayMs)
             .with_context(|| format!("failed to parse delay duration: {s}"))
+    }
+}
+
+#[cfg(test)]
+mod twg_settings_tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_work_settings() {
+        let settings: SettingsContent = serde_json::from_str(r#"{
+            "twg": {"executable":"/custom/twg","site":"example.atlassian.net","default_project":"DAT","refresh_interval_minutes":5},
+            "work_panel": {"dock":"left","default_width":420,"button":true}
+        }"#).expect("valid work settings");
+        let twg = settings.twg.expect("TWG section is deserialized");
+        assert_eq!(twg.executable.as_deref(), Some("/custom/twg"));
+        assert_eq!(twg.site.as_deref(), Some("example.atlassian.net"));
+        assert_eq!(twg.default_project.as_deref(), Some("DAT"));
+        assert_eq!(twg.refresh_interval_minutes, Some(5));
+        let panel = settings
+            .work_panel
+            .expect("Work panel section is deserialized");
+        assert_eq!(panel.dock, Some(DockSide::Left));
+        assert_eq!(panel.default_width, Some(420.0));
+        assert_eq!(panel.button, Some(true));
     }
 }

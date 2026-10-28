@@ -1,5 +1,16 @@
 {
   "$schema": "zed://schemas/settings",
+  "twg": {
+    "executable": "",
+    "site": "",
+    "default_project": "",
+    "refresh_interval_minutes": 5,
+  },
+  "work_panel": {
+    "dock": "left",
+    "default_width": 420,
+    "button": true,
+  },
   // The name of the Zed theme to use for the UI.
   //
   // `mode` is one of:

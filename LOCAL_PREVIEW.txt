@@ -1,4 +1,13 @@
-Zed Agent Redesign — local development preview
+Zed fork — local development
+
+Current installation target: /Applications/Zed.app only.
+Do not install new builds into ~/Applications/Zed Agent Redesign.app or modify
+its preview profile. That app is retained as a historical preview.
+Current source branch: main in https://github.com/msriv/zed.
+
+The notes below describe the original preview setup and earlier verification.
+
+Zed Agent Redesign — historical development preview
 
 App: ~/Applications/Zed Agent Redesign.app
 Source: ~/Developer/zed-agent-redesign
