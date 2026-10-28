@@ -1207,6 +1207,9 @@ impl Pane {
     ) -> Option<usize> {
         let item_idx = self.preview_item_idx()?;
         let id = self.preview_item_id()?;
+        if !self.items[item_idx].can_close(cx) {
+            return None;
+        }
         self.preview_item_id = None;
 
         let prev_active_item_index = self.active_item_index;
@@ -1886,7 +1889,11 @@ impl Pane {
                 continue;
             }
 
-            if let Some(true) = self.items.get(index).map(|item| item.is_dirty(cx)) {
+            if self
+                .items
+                .get(index)
+                .is_some_and(|item| item.is_dirty(cx) || !item.can_close(cx))
+            {
                 continue;
             }
 
@@ -1918,7 +1925,10 @@ impl Pane {
             }
         });
         if dirty_project_item_ids.is_empty() {
-            return !(item.buffer_kind(cx) == ItemBufferKind::Singleton && item.is_dirty(cx));
+            return !((item.buffer_kind(cx) == ItemBufferKind::Singleton
+                || item.can_save(cx)
+                || item.can_save_as(cx))
+                && item.is_dirty(cx));
         }
 
         for open_item in workspace.items(cx) {
@@ -1971,7 +1981,7 @@ impl Pane {
         // Find the items to close.
         let mut items_to_close = Vec::new();
         for item in &self.items {
-            if should_close(item.item_id()) {
+            if should_close(item.item_id()) && item.can_close(cx) {
                 items_to_close.push(item.boxed_clone());
             }
         }
@@ -2023,6 +2033,9 @@ impl Pane {
             }
 
             for item_to_close in items_to_close {
+                if !cx.update(|_, cx| item_to_close.can_close(cx))? {
+                    continue;
+                }
                 let mut should_close = true;
                 let mut should_save = true;
                 if save_intent == SaveIntent::Close {
@@ -2076,6 +2089,9 @@ impl Pane {
                 // Remove the item from the pane.
                 if should_close {
                     pane.update_in(cx, |pane, window, cx| {
+                        if !item_to_close.can_close(cx) {
+                            return;
+                        }
                         pane.remove_item(
                             item_to_close.item_id(),
                             false,
@@ -2264,6 +2280,12 @@ impl Pane {
 
         const DELETED_MESSAGE: &str = "This file has been deleted on disk since you started editing it. Do you want to recreate it?";
 
+        if matches!(save_intent, SaveIntent::Close | SaveIntent::Skip)
+            && !cx.update(|_, cx| item.can_close(cx))?
+        {
+            return Ok(false);
+        }
+
         let path_style = project.read_with(cx, |project, cx| project.path_style(cx));
         if save_intent == SaveIntent::Skip {
             let is_saveable_singleton = cx.update(|_window, cx| {
@@ -2356,9 +2378,16 @@ impl Pane {
                         .await?
                     }
                     Ok(1) => {
-                        pane.update_in(cx, |pane, window, cx| {
-                            pane.remove_item(item.item_id(), false, true, window, cx)
+                        let closed = pane.update_in(cx, |pane, window, cx| {
+                            if !item.can_close(cx) {
+                                return false;
+                            }
+                            pane.remove_item(item.item_id(), false, true, window, cx);
+                            true
                         })?;
+                        if !closed {
+                            return Ok(false);
+                        }
                     }
                     _ => return Ok(false),
                 }
@@ -2643,6 +2672,7 @@ impl Pane {
         let item_id = self.items().find_map(|item| {
             if item.buffer_kind(cx) == ItemBufferKind::Singleton
                 && item.project_entry_ids(cx).as_slice() == [entry_id]
+                && item.can_close(cx)
             {
                 Some(item.item_id())
             } else {
@@ -9142,6 +9172,145 @@ mod tests {
     async fn test_split_move(cx: &mut TestAppContext) {
         for split_direction in SplitDirection::all() {
             test_single_pane_split(["A", "B"], split_direction, SplitMode::MovePane, cx).await;
+        }
+    }
+
+    #[gpui::test]
+    async fn test_dirty_non_buffer_item_tab_close_prompts_without_reload(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let item = cx.new(|cx| {
+            let mut item = TestItem::new(cx)
+                .with_buffer_kind(ItemBufferKind::None)
+                .with_dirty(true)
+                .with_save_error("use explicit submit");
+            item.can_save = true;
+            item
+        });
+        pane.update_in(cx, |pane, window, cx| {
+            pane.add_item(Box::new(item.clone()), true, true, None, window, cx);
+        });
+        for answer in ["Cancel", "Don't Save"] {
+            let close = pane.update_in(cx, |pane, window, cx| {
+                pane.close_item_by_id(item.item_id(), SaveIntent::Close, window, cx)
+            });
+            cx.run_until_parked();
+            assert!(cx.has_pending_prompt());
+            cx.simulate_prompt_answer(answer);
+            close.await.unwrap();
+            assert_eq!(
+                pane.read_with(cx, |pane, _| pane
+                    .index_for_item_id(item.item_id())
+                    .is_some()),
+                answer == "Cancel"
+            );
+        }
+        item.read_with(cx, |item, _| {
+            assert!(item.project_items.is_empty());
+            assert_eq!(item.save_count, 0);
+            assert_eq!(item.reload_count, 0);
+            assert_eq!(item.save_as_count, 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_item_close_veto_blocks_single_bulk_and_preview_close(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let guarded = add_labeled_item(&pane, "pending", false, cx);
+        guarded.update(cx, |item, _| item.can_close = false);
+        let normal = add_labeled_item(&pane, "normal", false, cx);
+
+        for intent in [SaveIntent::Close, SaveIntent::Skip] {
+            pane.update_in(cx, |pane, window, cx| {
+                pane.close_item_by_id(guarded.item_id(), intent, window, cx)
+            })
+            .await
+            .unwrap();
+            assert!(!cx.has_pending_prompt());
+            assert!(pane.read_with(cx, |pane, _| {
+                pane.index_for_item_id(guarded.item_id()).is_some()
+            }));
+        }
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_items(window, cx, SaveIntent::Skip, &|_| true)
+        })
+        .await
+        .unwrap();
+        pane.update_in(cx, |pane, window, cx| {
+            assert!(pane.index_for_item_id(normal.item_id()).is_none());
+            assert_eq!(pane.items_len(), 1);
+            pane.set_preview_item_id(Some(guarded.item_id()), cx);
+            assert_eq!(pane.close_current_preview_item(window, cx), None);
+            pane.close_items_to_target_count(Some(1), false, window, cx);
+            assert_eq!(pane.items_len(), 1);
+        });
+        guarded.update(cx, |item, _| item.can_close = true);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_item_by_id(guarded.item_id(), SaveIntent::Skip, window, cx)
+        })
+        .await
+        .unwrap();
+        assert_eq!(pane.read_with(cx, |pane, _| pane.items_len()), 0);
+    }
+
+    #[gpui::test]
+    async fn test_item_close_veto_rechecked_after_discard_and_save_error(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        for save_error in [false, true] {
+            let item = cx.new(|cx| {
+                let mut item = TestItem::new(cx)
+                    .with_dirty(true)
+                    .with_project_items(&[TestProjectItem::new(1, "pending.txt", cx)]);
+                if save_error {
+                    item.save_error = Some("write failed".into());
+                }
+                item
+            });
+            let close = pane.update_in(cx, |pane, window, cx| {
+                pane.add_item(Box::new(item.clone()), true, true, None, window, cx);
+                pane.close_item_by_id(
+                    item.item_id(),
+                    if save_error {
+                        SaveIntent::SaveAll
+                    } else {
+                        SaveIntent::Close
+                    },
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            assert!(cx.has_pending_prompt());
+            item.update(cx, |item, _| item.can_close = false);
+            cx.simulate_prompt_answer(if save_error {
+                "Close Without Saving"
+            } else {
+                "Don't Save"
+            });
+            close.await.unwrap();
+            assert!(pane.read_with(cx, |pane, _| {
+                pane.index_for_item_id(item.item_id()).is_some()
+            }));
+            item.update(cx, |item, _| item.can_close = true);
+            pane.update_in(cx, |pane, window, cx| {
+                pane.close_item_by_id(item.item_id(), SaveIntent::Skip, window, cx)
+            })
+            .await
+            .unwrap();
         }
     }
 

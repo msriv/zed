@@ -276,6 +276,10 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         _ = (workspace_id, window, cx);
         unimplemented!("clone_on_split() must be implemented if can_split() returns true")
     }
+    /// Returns whether this item can currently be closed or its workspace removed.
+    fn can_close(&self, _: &App) -> bool {
+        true
+    }
     fn is_dirty(&self, _: &App) -> bool {
         false
     }
@@ -525,6 +529,7 @@ pub trait ItemHandle: 'static + Send {
     fn navigate(&self, data: Arc<dyn Any + Send>, window: &mut Window, cx: &mut App) -> bool;
     fn item_id(&self) -> EntityId;
     fn to_any_view(&self) -> AnyView;
+    fn can_close(&self, cx: &App) -> bool;
     fn is_dirty(&self, cx: &App) -> bool;
     fn capability(&self, cx: &App) -> Capability;
     fn toggle_read_only(&self, window: &mut Window, cx: &mut App);
@@ -1035,6 +1040,10 @@ impl<T: Item> ItemHandle for Entity<T> {
         self.clone().into()
     }
 
+    fn can_close(&self, cx: &App) -> bool {
+        self.read(cx).can_close(cx)
+    }
+
     fn is_dirty(&self, cx: &App) -> bool {
         self.read(cx).is_dirty(cx)
     }
@@ -1454,6 +1463,8 @@ pub mod test {
         pub save_as_count: usize,
         pub reload_count: usize,
         pub is_dirty: bool,
+        pub can_close: bool,
+        pub can_save: bool,
         pub save_error: Option<String>,
         pub buffer_kind: ItemBufferKind,
         pub has_conflict: bool,
@@ -1547,6 +1558,8 @@ pub mod test {
                 save_as_count: 0,
                 reload_count: 0,
                 is_dirty: false,
+                can_close: true,
+                can_save: false,
                 save_error: None,
                 has_conflict: false,
                 has_deleted_file: false,
@@ -1747,6 +1760,8 @@ pub mod test {
                     save_as_count: self.save_as_count,
                     reload_count: self.reload_count,
                     is_dirty: self.is_dirty,
+                    can_close: self.can_close,
+                    can_save: self.can_save,
                     save_error: self.save_error.clone(),
                     buffer_kind: self.buffer_kind,
                     has_conflict: self.has_conflict,
@@ -1768,6 +1783,10 @@ pub mod test {
             })))
         }
 
+        fn can_close(&self, _: &App) -> bool {
+            self.can_close
+        }
+
         fn is_dirty(&self, _: &App) -> bool {
             self.is_dirty
         }
@@ -1781,11 +1800,12 @@ pub mod test {
         }
 
         fn can_save(&self, cx: &App) -> bool {
-            !self.project_items.is_empty()
-                && self
-                    .project_items
-                    .iter()
-                    .all(|item| item.read(cx).entry_id.is_some())
+            self.can_save
+                || (!self.project_items.is_empty()
+                    && self
+                        .project_items
+                        .iter()
+                        .all(|item| item.read(cx).entry_id.is_some()))
         }
 
         fn can_save_as(&self, _cx: &App) -> bool {

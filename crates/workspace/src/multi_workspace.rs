@@ -578,8 +578,17 @@ impl MultiWorkspace {
             crate::flush_windows_serialization(&[window_handle], cx).await;
 
             window_handle
-                .update(cx, |_, window, _cx| {
-                    window.remove_window();
+                .update(cx, |multi_workspace, window, cx| {
+                    if multi_workspace
+                        .workspaces()
+                        .all(|workspace| workspace.read(cx).can_close(cx))
+                    {
+                        window.remove_window();
+                    } else {
+                        for workspace in multi_workspace.workspaces() {
+                            workspace.update(cx, |workspace, _| workspace.removing = false);
+                        }
+                    }
                 })
                 .context("removing the closed window")?;
 
@@ -1338,6 +1347,12 @@ impl MultiWorkspace {
         let old_active_workspace = self.workspace().clone();
         let old_active_was_retained = self.active_workspace_is_retained();
         let should_retain_workspaces = self.multi_workspace_enabled(cx);
+        if !should_retain_workspaces
+            && !old_active_was_retained
+            && !old_active_workspace.read(cx).can_close(cx)
+        {
+            return;
+        }
 
         if should_retain_workspaces && !old_active_was_retained {
             let key = old_active_workspace.read(cx).project_group_key(cx);
@@ -1395,7 +1410,7 @@ impl MultiWorkspace {
         cx.notify();
     }
 
-    /// Collapses to a single workspace, discarding all groups.
+    /// Discards inactive workspaces while preserving local drafts and pending item writes.
     /// Used when multi-workspace is disabled by settings.
     fn collapse_to_single_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sidebar_open {
@@ -1404,15 +1419,22 @@ impl MultiWorkspace {
 
         let displayed_workspace = self.workspace().clone();
         for workspace in self.workspaces().cloned().collect::<Vec<_>>() {
-            if workspace != displayed_workspace {
+            if workspace != displayed_workspace && workspace.read(cx).can_discard_local_items(cx) {
                 self.detach_workspace(&workspace, cx);
             }
         }
 
-        for held in &mut self.held {
-            held.pinned = false;
-        }
-        self.project_groups.clear();
+        let retained_keys = self
+            .held
+            .iter_mut()
+            .filter_map(|held| {
+                held.pinned = held.workspace != displayed_workspace;
+                held.pinned
+                    .then(|| held.workspace.read(cx).project_group_key(cx))
+            })
+            .collect::<Vec<_>>();
+        self.project_groups
+            .retain(|group| retained_keys.contains(&group.key));
         cx.notify();
     }
 
@@ -1833,6 +1855,12 @@ impl MultiWorkspace {
             // Edit phase: one synchronous update. Delete the rows, then pick
             // the replacement from the rows that actually remain.
             let (removed_any, reopen_key) = this.update_in(cx, |this, window, cx| {
+                if workspaces
+                    .iter()
+                    .any(|workspace| !workspace.read(cx).can_close(cx))
+                {
+                    return (false, None);
+                }
                 let mut removed_any = false;
                 let displayed_workspace = this.workspace().clone();
 
@@ -1991,7 +2019,9 @@ impl MultiWorkspace {
                     && empty_workspace != new_workspace
                 {
                     this.update(cx, |this, cx| {
-                        if this.is_workspace_retained(&empty_workspace) {
+                        if this.is_workspace_retained(&empty_workspace)
+                            && empty_workspace.read(cx).can_close(cx)
+                        {
                             this.detach_workspace(&empty_workspace, cx);
                         }
                     })?;

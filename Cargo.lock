@@ -16432,9 +16432,11 @@ dependencies = [
  "settings",
  "shell_command_parser",
  "strum 0.28.0",
+ "task",
  "telemetry",
  "theme",
  "theme_settings",
+ "twg",
  "ui",
  "ui_input",
  "url",
@@ -19105,6 +19107,23 @@ dependencies = [
  "sha1",
  "thiserror 2.0.17",
  "utf-8",
+]
+
+[[package]]
+name = "twg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "diffy",
+ "futures 0.3.34",
+ "gpui",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "smol",
+ "url",
+ "util",
 ]
 
 [[package]]
@@ -21855,6 +21874,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "work_panel"
+version = "0.1.0"
+dependencies = [
+ "agent_ui",
+ "anyhow",
+ "editor",
+ "futures 0.3.34",
+ "git",
+ "git_ui_core",
+ "gpui",
+ "markdown",
+ "project",
+ "serde_json",
+ "settings",
+ "twg",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "workspace"
 version = "0.1.0"
 dependencies = [
@@ -22520,6 +22561,7 @@ dependencies = [
  "title_bar",
  "toolchain_selector",
  "tracing",
+ "twg",
  "ui",
  "ui_prompt",
  "url",
@@ -22534,6 +22576,7 @@ dependencies = [
  "which_key",
  "windows 0.62.2",
  "windows_resources",
+ "work_panel",
  "workspace",
  "zed-reqwest",
  "zed_actions",

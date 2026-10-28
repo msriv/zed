@@ -41,3 +41,6 @@ pub use tool_permissions_setup::{
     render_move_path_tool_config, render_skill_tool_config, render_terminal_tool_config,
     render_web_search_tool_config, render_write_file_tool_config,
 };
+
+mod twg_settings_page;
+pub(crate) use twg_settings_page::{TwgConnection, render_twg_connection};

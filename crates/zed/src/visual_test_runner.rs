@@ -34,11 +34,15 @@
 //!
 //!   UPDATE_BASELINE - Set to update baseline images instead of comparing
 //!   VISUAL_TEST_OUTPUT_DIR - Directory to save test output (default: target/visual_tests)
-//!   VISUAL_TEST_FILTER - Set to agent_conversation_redesign to capture only that fixture
+//!   VISUAL_TEST_FILTER - Set to agent_conversation_redesign or work_panel to capture that fixture
 
 #[cfg(all(target_os = "macos", feature = "visual-tests"))]
 #[path = "zed/agent_conversation_visual_fixture.rs"]
 mod agent_conversation_visual_fixture;
+
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+#[path = "zed/work_panel_visual_fixture.rs"]
+mod work_panel_visual_fixture;
 
 // Stub main for non-macOS platforms
 #[cfg(not(target_os = "macos"))]
@@ -171,7 +175,13 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     });
 
     // Create AppState using the test initialization
-    let app_state = cx.update(|cx| init_app_state(cx));
+    let app_state = cx.update(|cx| {
+        #[cfg(feature = "visual-tests")]
+        if std::env::var("VISUAL_TEST_FILTER").as_deref() == Ok("work_panel") {
+            return AppState::test(cx);
+        }
+        init_app_state(cx)
+    });
 
     // Set the global app state so settings_ui and other subsystems can find it
     cx.update(|cx| {
@@ -181,7 +191,12 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     // Initialize all Zed subsystems
     cx.update(|cx| {
         gpui_tokio::init(cx);
-        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        let themes = if std::env::var("VISUAL_TEST_FILTER").as_deref() == Ok("work_panel") {
+            theme::LoadThemes::All(Box::new(Assets))
+        } else {
+            theme::LoadThemes::JustBase
+        };
+        theme_settings::init(themes, cx);
         client::init(&app_state.client, cx);
         audio::init(cx);
         workspace::init(app_state.clone(), cx);
@@ -230,6 +245,21 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         );
         settings_ui::init(cx);
 
+        #[cfg(feature = "visual-tests")]
+        if std::env::var("VISUAL_TEST_FILTER").as_deref() == Ok("work_panel") {
+            twg::TwgSettings::register(cx);
+            work_panel::init(cx);
+            twg::TwgSettings::override_global(
+                twg::TwgSettings {
+                    executable: "/fixture/no-twg-process".into(),
+                    site: "https://jira.example.invalid".into(),
+                    default_project: "DAT".into(),
+                    refresh_interval_minutes: 5,
+                },
+                cx,
+            );
+        }
+
         // Load default keymaps so tooltips can show keybindings like "f9" for ToggleBreakpoint
         // We load a minimal set of editor keybindings needed for visual tests
         cx.bind_keys([KeyBinding::new(
@@ -251,6 +281,12 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
 
     // Run until all initialization tasks complete
     cx.run_until_parked();
+
+    #[cfg(feature = "visual-tests")]
+    if std::env::var("VISUAL_TEST_FILTER").as_deref() == Ok("work_panel") {
+        work_panel_visual_fixture::run(app_state, &mut cx, update_baseline)?;
+        return Ok(());
+    }
 
     #[cfg(feature = "visual-tests")]
     if std::env::var("VISUAL_TEST_FILTER").as_deref() == Ok("agent_conversation_redesign") {

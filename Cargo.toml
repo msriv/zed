@@ -225,6 +225,7 @@ members = [
     "crates/time_format",
     "crates/title_bar",
     "crates/toolchain_selector",
+    "crates/twg",
     "crates/ui",
     "crates/ui_input",
     "crates/ui_macros",
@@ -238,6 +239,7 @@ members = [
     "crates/web_search_providers",
     "crates/which_key",
     "crates/windows_resources",
+    "crates/work_panel",
     "crates/workspace",
     "crates/worktree",
     "crates/worktree_benchmarks",
@@ -496,6 +498,7 @@ theme_settings = { path = "crates/theme_settings" }
 time_format = { path = "crates/time_format" }
 title_bar = { path = "crates/title_bar" }
 toolchain_selector = { path = "crates/toolchain_selector" }
+twg = { path = "crates/twg" }
 ui = { path = "crates/ui" }
 ui_input = { path = "crates/ui_input" }
 ui_macros = { path = "crates/ui_macros" }
@@ -509,6 +512,7 @@ web_search = { path = "crates/web_search" }
 web_search_providers = { path = "crates/web_search_providers" }
 which_key = { path = "crates/which_key" }
 windows_resources = { path = "crates/windows_resources" }
+work_panel = { path = "crates/work_panel" }
 workspace = { path = "crates/workspace" }
 worktree = { path = "crates/worktree" }
 x_ai = { path = "crates/x_ai" }

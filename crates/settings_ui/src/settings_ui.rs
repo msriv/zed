@@ -1013,6 +1013,7 @@ pub struct SettingsWindow {
     /// mouse, where `focus_visible` styling would otherwise be suppressed).
     pub(crate) external_agent_add_focus_handle: FocusHandle,
     skill_creator_page: Option<(Entity<pages::SkillCreatorPage>, Subscription)>,
+    twg_connection: RefCell<Option<Entity<pages::TwgConnection>>>,
 }
 
 struct SearchDocument {
@@ -1085,6 +1086,7 @@ struct SettingsPage {
 
 #[derive(PartialEq)]
 enum SettingsPageItem {
+    TwgConnection,
     SectionHeader(&'static str),
     SettingItem(SettingItem),
     SubPageLink(SubPageLink),
@@ -1095,6 +1097,7 @@ enum SettingsPageItem {
 impl std::fmt::Debug for SettingsPageItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SettingsPageItem::TwgConnection => write!(f, "TwgConnection"),
             SettingsPageItem::SectionHeader(header) => write!(f, "SectionHeader({})", header),
             SettingsPageItem::SettingItem(setting_item) => {
                 write!(f, "SettingItem({})", setting_item.title)
@@ -1199,6 +1202,9 @@ impl SettingsPageItem {
             };
 
         match self {
+            SettingsPageItem::TwgConnection => {
+                pages::render_twg_connection(settings_window, window, cx)
+            }
             SettingsPageItem::SectionHeader(header) => {
                 SettingsSectionHeader::new(SharedString::new_static(header)).into_any_element()
             }
@@ -2035,6 +2041,7 @@ impl SettingsWindow {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            twg_connection: RefCell::default(),
         };
 
         this.fetch_files(window, cx);
@@ -2232,6 +2239,13 @@ impl SettingsWindow {
                         ..
                     }) => {
                         if !files.contains(current_file) {
+                            page_filter[index] = false;
+                        } else {
+                            any_found_since_last_header = true;
+                        }
+                    }
+                    SettingsPageItem::TwgConnection => {
+                        if !USER.contains(current_file) {
                             page_filter[index] = false;
                         } else {
                             any_found_since_last_header = true;
@@ -2477,6 +2491,21 @@ impl SettingsWindow {
                         for alias in sub_page_link.search_aliases {
                             push_candidates(&mut fuzzy_match_candidates, key_index, alias);
                         }
+                    }
+                    SettingsPageItem::TwgConnection => {
+                        documents.push(SearchDocument {
+                            id: key_index,
+                            words: split_into_words(&[
+                                page.title,
+                                header_str,
+                                "TWG connection sign in sign out credentials",
+                            ]),
+                        });
+                        push_candidates(
+                            &mut fuzzy_match_candidates,
+                            key_index,
+                            "TWG connection sign in sign out credentials",
+                        );
                     }
                     SettingsPageItem::ActionLink(action_link) => {
                         documents.push(SearchDocument {
@@ -5507,6 +5536,7 @@ pub mod test {
                 custom_agent_form: None,
                 external_agent_add_focus_handle: cx.focus_handle(),
                 skill_creator_page: None,
+                twg_connection: RefCell::default(),
             }
         }
     }
@@ -5647,6 +5677,7 @@ pub mod test {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            twg_connection: RefCell::default(),
         };
 
         settings_window.build_filter_table();

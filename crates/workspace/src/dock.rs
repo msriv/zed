@@ -10,8 +10,8 @@ use db::kvp::KeyValueStore;
 use gpui::{
     Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    Render, SharedString, StyleRefinement, Styled, Subscription, Task, WeakEntity, Window,
+    deferred, div, px,
 };
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
@@ -36,6 +36,13 @@ pub use proto::PanelId;
 pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn persistent_name() -> &'static str;
     fn panel_key() -> &'static str;
+    fn prepare_to_close(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<bool>> {
+        Task::ready(Ok(true))
+    }
     /// The `Focusable::focus_handle` root identifies the panel's subtree for containment checks
     /// and must be tracked by the panel's root element. This method returns the handle that should
     /// receive focus when the panel is activated, such as a filter, commit, or message editor; it
@@ -107,6 +114,7 @@ pub trait PanelHandle: Send + Sync {
     fn panel_id(&self) -> EntityId;
     fn persistent_name(&self) -> &'static str;
     fn panel_key(&self) -> &'static str;
+    fn prepare_to_close(&self, window: &mut Window, cx: &mut App) -> Task<anyhow::Result<bool>>;
     fn position(&self, window: &Window, cx: &App) -> DockPosition;
     fn position_is_valid(&self, position: DockPosition, cx: &App) -> bool;
     fn set_position(&self, position: DockPosition, window: &mut Window, cx: &mut App);
@@ -165,6 +173,10 @@ where
 
     fn panel_key(&self) -> &'static str {
         T::panel_key()
+    }
+
+    fn prepare_to_close(&self, window: &mut Window, cx: &mut App) -> Task<anyhow::Result<bool>> {
+        self.update(cx, |this, cx| this.prepare_to_close(window, cx))
     }
 
     fn position(&self, window: &Window, cx: &App) -> DockPosition {
@@ -927,6 +939,10 @@ impl Dock {
         self.panel_entries.len()
     }
 
+    pub(crate) fn panels(&self) -> impl Iterator<Item = &Arc<dyn PanelHandle>> {
+        self.panel_entries.iter().map(|entry| &entry.panel)
+    }
+
     pub fn has_agent_panel(&self, cx: &App) -> bool {
         self.panel_entries
             .iter()
@@ -1621,6 +1637,8 @@ pub mod test {
         pub default_size: Pixels,
         pub flexible: bool,
         pub activation_priority: u32,
+        pub allow_close: bool,
+        pub close_attempts: usize,
     }
     actions!(test_only, [ToggleTestPanel]);
 
@@ -1637,6 +1655,8 @@ pub mod test {
                 default_size: px(300.),
                 flexible: false,
                 activation_priority,
+                allow_close: true,
+                close_attempts: 0,
             }
         }
 
@@ -1675,6 +1695,15 @@ pub mod test {
     }
 
     impl Panel for TestPanel {
+        fn prepare_to_close(
+            &mut self,
+            _: &mut Window,
+            _: &mut Context<Self>,
+        ) -> Task<anyhow::Result<bool>> {
+            self.close_attempts += 1;
+            Task::ready(Ok(self.allow_close))
+        }
+
         fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
             self.activation_focus_handle
                 .clone()

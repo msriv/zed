@@ -1806,7 +1806,22 @@ impl Workspace {
                 }
 
                 project::Event::Closed => {
-                    window.remove_window();
+                    let current_id = cx.entity().entity_id();
+                    let can_discard = this.can_discard_local_items(cx)
+                        && this
+                            .multi_workspace
+                            .as_ref()
+                            .and_then(WeakEntity::upgrade)
+                            .is_none_or(|multi_workspace| {
+                                multi_workspace
+                                    .read(cx)
+                                    .workspaces()
+                                    .filter(|workspace| workspace.entity_id() != current_id)
+                                    .all(|workspace| workspace.read(cx).can_discard_local_items(cx))
+                            });
+                    if can_discard {
+                        window.remove_window();
+                    }
                 }
 
                 project::Event::DeletedEntry(_, entry_id) => {
@@ -3694,11 +3709,23 @@ impl Workspace {
         cx.defer(|cx| {
             cx.windows().iter().find(|window| {
                 window
-                    .update(cx, |_, window, _| {
+                    .update(cx, |root, window, cx| {
                         if window.is_window_active() {
-                            //This can only get called when the window's project connection has been lost
-                            //so we don't need to prompt the user for anything and instead just close the window
-                            window.remove_window();
+                            let can_discard = if let Ok(multi_workspace) =
+                                root.clone().downcast::<MultiWorkspace>()
+                            {
+                                multi_workspace
+                                    .read(cx)
+                                    .workspaces()
+                                    .all(|workspace| workspace.read(cx).can_discard_local_items(cx))
+                            } else if let Ok(workspace) = root.downcast::<Workspace>() {
+                                workspace.read(cx).can_discard_local_items(cx)
+                            } else {
+                                true
+                            };
+                            if can_discard {
+                                window.remove_window();
+                            }
                             true
                         } else {
                             false
@@ -3733,15 +3760,48 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn can_close(&self, cx: &App) -> bool {
+        self.items(cx).all(|item| item.can_close(cx))
+    }
+
+    /// Whether automatic project teardown can discard the items without prompting.
+    pub(crate) fn can_discard_local_items(&self, cx: &App) -> bool {
+        self.can_close(cx)
+            && !self.items(cx).any(|item| {
+                item.buffer_kind(cx) == ItemBufferKind::None
+                    && item.is_dirty(cx)
+                    && (item.can_save(cx) || item.can_save_as(cx))
+            })
+    }
+
     pub fn prepare_to_close(
         &mut self,
         close_intent: CloseIntent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<bool>> {
+        if !self.can_close(cx) {
+            return Task::ready(Ok(false));
+        }
         let active_call = self.active_global_call();
 
         cx.spawn_in(window, async move |this, cx| {
+            let panels = this.read_with(cx, |this, cx| {
+                let mut panels = Vec::new();
+                for dock in [&this.left_dock, &this.right_dock, &this.bottom_dock] {
+                    panels.extend(dock.read(cx).panels().cloned());
+                }
+                panels
+            })?;
+            for panel in panels {
+                if !cx
+                    .update(|window, cx| panel.prepare_to_close(window, cx))?
+                    .await?
+                {
+                    return Ok(false);
+                }
+            }
+
             this.update(cx, |this, _| {
                 if close_intent == CloseIntent::CloseWindow {
                     this.removing = true;
@@ -3851,6 +3911,9 @@ impl Workspace {
                     )
                 })?
                 .await;
+            if !save_result.as_ref().is_ok_and(|&saved| saved) {
+                this.update(cx, |this, _| this.removing = false)?;
+            }
 
             // If we're not quitting, but closing, we remove the workspace from
             // the current session.
@@ -3977,15 +4040,21 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<bool>> {
-        if self.project.read(cx).is_disconnected(cx) {
-            return Task::ready(Ok(true));
+        let closing = save_intent == SaveIntent::Close;
+        if closing && !self.can_close(cx) {
+            return Task::ready(Ok(false));
         }
+        let disconnected = self.project.read(cx).is_disconnected(cx);
         let dirty_items = self
             .panes
             .iter()
             .flat_map(|pane| {
                 pane.read(cx).items().filter_map(|item| {
-                    if item.is_dirty(cx) {
+                    if item.is_dirty(cx)
+                        && (!disconnected
+                            || (item.buffer_kind(cx) == ItemBufferKind::None
+                                && (item.can_save(cx) || item.can_save_as(cx))))
+                    {
                         item.tab_content_text(0, cx);
                         Some((pane.clone(), item.boxed_clone()))
                     } else {
@@ -4056,19 +4125,19 @@ impl Workspace {
             };
 
             for (pane, item) in dirty_items {
-                let (singleton, project_entry_ids) = cx.update(|_, cx| {
-                    (
-                        item.buffer_kind(cx) == ItemBufferKind::Singleton,
-                        item.project_entry_ids(cx),
-                    )
+                let should_save = cx.update(|_, cx| {
+                    item.buffer_kind(cx) == ItemBufferKind::Singleton
+                        || !item.project_entry_ids(cx).is_empty()
+                        || item.can_save(cx)
+                        || item.can_save_as(cx)
                 })?;
-                if (singleton || !project_entry_ids.is_empty())
+                if should_save
                     && !Pane::save_item(project.clone(), pane, &*item, save_intent, cx).await?
                 {
                     return Ok(false);
                 }
             }
-            Ok(true)
+            Ok(!closing || workspace.read_with(cx, |workspace, cx| workspace.can_close(cx))?)
         })
     }
 
@@ -12059,8 +12128,13 @@ pub async fn prepare_windows_to_quit(
         flush_windows_serialization(&prepared_windows, cx).await;
         for window in prepared_windows {
             window
-                .update(cx, |_, window, _cx| {
-                    window.remove_window();
+                .update(cx, |multi_workspace, window, cx| {
+                    if multi_workspace
+                        .workspaces()
+                        .all(|workspace| workspace.read(cx).can_close(cx))
+                    {
+                        window.remove_window();
+                    }
                 })
                 .log_err();
         }
@@ -12071,7 +12145,15 @@ pub async fn prepare_windows_to_quit(
     // session_id/window_id are up-to-date in the database.
     flush_windows_serialization(workspace_windows, cx).await;
 
-    true
+    workspace_windows.iter().all(|window| {
+        window
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .workspaces()
+                    .all(|workspace| workspace.read(cx).can_close(cx))
+            })
+            .unwrap_or(true)
+    })
 }
 
 pub(crate) async fn prepare_window_to_close(
@@ -12116,6 +12198,13 @@ pub(crate) async fn prepare_window_to_close(
     // whichever happened to be last.
     window
         .update(cx, |multi_workspace, window, cx| {
+            if matches!(prepared, Ok(true))
+                && multi_workspace
+                    .workspaces()
+                    .any(|workspace| !workspace.read(cx).can_close(cx))
+            {
+                prepared = Ok(false);
+            }
             if !matches!(prepared, Ok(true)) {
                 for workspace in multi_workspace.workspaces() {
                     workspace.update(cx, |workspace, _| {
@@ -13357,6 +13446,308 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_close_window_respects_hidden_panel_veto_in_each_dock(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let panels = workspace.update_in(cx, |workspace, window, cx| {
+            [
+                DockPosition::Left,
+                DockPosition::Right,
+                DockPosition::Bottom,
+            ]
+            .map(|position| {
+                let panel = cx.new(|cx| TestPanel::new(position, 100, cx));
+                workspace.add_panel(panel.clone(), window, cx);
+                panel
+            })
+        });
+        for panel in &panels {
+            panel.update(cx, |panel, _| panel.allow_close = false);
+            let close = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.prepare_to_close(CloseIntent::CloseWindow, window, cx)
+            });
+            assert!(!close.await.expect("close result"));
+            assert!(!workspace.read_with(cx, |workspace, _| workspace.removing));
+            assert!(!cx.has_pending_prompt());
+            panel.update(cx, |panel, _| panel.allow_close = true);
+        }
+        for panel in &panels {
+            assert!(panel.read_with(cx, |panel, _| panel.close_attempts) > 0);
+        }
+        let close = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.prepare_to_close(CloseIntent::CloseWindow, window, cx)
+        });
+        assert!(close.await.expect("close result"));
+    }
+
+    #[gpui::test]
+    async fn test_disconnected_project_still_prompts_for_non_buffer_draft(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        project.update(cx, |project, cx| {
+            project.mark_as_collab_for_testing();
+            project.disconnected_from_host(cx);
+            assert!(project.is_disconnected(cx));
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let draft = cx.new(|cx| {
+            let mut item = TestItem::new(cx)
+                .with_buffer_kind(ItemBufferKind::None)
+                .with_dirty(true)
+                .with_save_error("local draft requires explicit submit");
+            item.can_save = true;
+            item
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            let file = cx.new(|cx| {
+                TestItem::new(cx)
+                    .with_dirty(true)
+                    .with_project_items(&[TestProjectItem::new(1, "disconnected.txt", cx)])
+                    .with_save_error("disconnected file must be skipped")
+            });
+            workspace.add_item_to_active_pane(Box::new(file), None, true, window, cx);
+            workspace.add_item_to_active_pane(Box::new(draft.clone()), None, true, window, cx);
+        });
+        let save = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_all_internal(SaveIntent::SaveAll, true, window, cx)
+        });
+        assert_eq!(
+            save.await.unwrap_err().to_string(),
+            "local draft requires explicit submit"
+        );
+        for answer in ["Cancel", "Don't Save"] {
+            let close = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.prepare_to_close(CloseIntent::CloseWindow, window, cx)
+            });
+            cx.run_until_parked();
+            assert!(cx.has_pending_prompt());
+            cx.simulate_prompt_answer(answer);
+            assert_eq!(close.await.unwrap(), answer == "Don't Save");
+        }
+        assert_eq!(draft.read_with(cx, |item, _| item.reload_count), 0);
+    }
+
+    #[gpui::test]
+    async fn test_project_teardown_and_workspace_collapse_retain_local_work(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", json!({"one": {}, "two": {}, "three": {}}))
+            .await;
+        let project_a = Project::test(fs.clone(), ["/root/one".as_ref()], cx).await;
+        let project_b = Project::test(fs.clone(), ["/root/two".as_ref()], cx).await;
+        let project_c = Project::test(fs, ["/root/three".as_ref()], cx).await;
+        let handle = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+        let workspace_a = handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let draft = cx.new(|cx| {
+            let mut item = TestItem::new(cx)
+                .with_buffer_kind(ItemBufferKind::None)
+                .with_dirty(true);
+            item.can_save = true;
+            item
+        });
+        handle
+            .update(cx, |mw, window, cx| {
+                mw.open_sidebar(cx);
+                workspace_a.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(draft.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+        let workspace_b = handle
+            .update(cx, |mw, window, cx| {
+                mw.test_add_workspace(project_b, window, cx)
+            })
+            .unwrap();
+        let pending = cx.new(TestItem::new);
+        pending.update(cx, |item, _| item.can_close = false);
+        handle
+            .update(cx, |mw, window, cx| {
+                workspace_b.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(Box::new(pending), None, true, window, cx);
+                });
+                mw.test_add_workspace(project_c.clone(), window, cx);
+            })
+            .unwrap();
+        project_c.update(cx, |project, cx| project.close(cx));
+        cx.run_until_parked();
+        assert!(
+            handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+        );
+        cx.update(Workspace::close_global);
+        cx.run_until_parked();
+        assert!(handle.update(cx, |_, _, _| ()).is_ok());
+
+        cx.update_global::<SettingsStore, ()>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.disable_ai = Some(true.into())
+            });
+        });
+        cx.run_until_parked();
+        handle
+            .read_with(cx, |mw, cx| {
+                assert_eq!(mw.workspaces().count(), 3);
+                for workspace in [&workspace_a, &workspace_b] {
+                    assert!(mw.is_workspace_retained(workspace));
+                    assert!(
+                        mw.project_group_keys()
+                            .contains(&workspace.read(cx).project_group_key(cx))
+                    );
+                }
+            })
+            .unwrap();
+        cx.update_global::<SettingsStore, ()>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.disable_ai = Some(false.into())
+            });
+        });
+        cx.run_until_parked();
+        handle
+            .update(cx, |mw, window, cx| {
+                mw.activate(workspace_a.clone(), None, window, cx);
+                assert_eq!(mw.workspace(), &workspace_a);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_dirty_non_buffer_item_window_close_prompts_and_save_all_propagates_error(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let item = cx.new(|cx| {
+            let mut item = TestItem::new(cx)
+                .with_buffer_kind(ItemBufferKind::None)
+                .with_dirty(true)
+                .with_save_error("use explicit submit");
+            item.can_save = true;
+            item
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+        });
+        let save = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_all_internal(SaveIntent::SaveAll, true, window, cx)
+        });
+        assert!(save.await.is_err());
+        assert!(!cx.has_pending_prompt());
+        for answer in ["Cancel", "Don't Save"] {
+            let close = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.prepare_to_close(CloseIntent::CloseWindow, window, cx)
+            });
+            cx.run_until_parked();
+            assert!(cx.has_pending_prompt());
+            cx.simulate_prompt_answer(answer);
+            assert_eq!(close.await.unwrap(), answer == "Don't Save");
+        }
+        item.read_with(cx, |item, _| {
+            assert!(item.project_items.is_empty());
+            assert!(item.is_dirty);
+            assert_eq!(item.save_count, 0);
+            assert_eq!(item.reload_count, 0);
+            assert_eq!(item.save_as_count, 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_workspace_item_close_veto_covers_all_close_intents_and_save_all(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let guarded = cx.new(TestItem::new);
+        guarded.update(cx, |item, _| item.can_close = false);
+        let dirty = cx.new(|cx| {
+            TestItem::new(cx)
+                .with_dirty(true)
+                .with_project_items(&[TestProjectItem::new(1, "save.txt", cx)])
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(guarded.clone()), None, true, window, cx);
+            workspace.add_item_to_active_pane(Box::new(dirty.clone()), None, true, window, cx);
+        });
+        let save = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.save_all_internal(SaveIntent::SaveAll, true, window, cx)
+        });
+        assert!(save.await.unwrap());
+        assert_eq!(dirty.read_with(cx, |item, _| item.save_count), 1);
+        for intent in [
+            CloseIntent::CloseWindow,
+            CloseIntent::ReplaceWindow,
+            CloseIntent::Quit,
+        ] {
+            let close = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.prepare_to_close(intent, window, cx)
+            });
+            assert!(!close.await.unwrap());
+            assert!(!workspace.read_with(cx, |workspace, _| workspace.removing));
+            assert!(!cx.has_pending_prompt());
+        }
+        guarded.update(cx, |item, _| item.can_close = true);
+        let close = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.prepare_to_close(CloseIntent::Quit, window, cx)
+        });
+        assert!(close.await.unwrap());
+    }
+
+    #[gpui::test]
+    async fn test_workspace_item_close_veto_rechecked_after_discard_all(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let guarded = cx.new(TestItem::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(guarded.clone()), None, true, window, cx);
+            for (id, name) in [(1, "one.txt"), (2, "two.txt")] {
+                let item = cx.new(|cx| {
+                    TestItem::new(cx)
+                        .with_dirty(true)
+                        .with_project_items(&[TestProjectItem::new(id, name, cx)])
+                });
+                workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+            }
+        });
+        let close = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.prepare_to_close(CloseIntent::CloseWindow, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        guarded.update(cx, |item, _| item.can_close = false);
+        cx.simulate_prompt_answer("Discard all");
+        assert!(!close.await.unwrap());
+        assert!(!workspace.read_with(cx, |workspace, _| workspace.removing));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace.items(cx).count()),
+            3
+        );
+    }
+
+    #[gpui::test]
     async fn test_close_window(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -13397,6 +13788,78 @@ mod tests {
         cx.executor().run_until_parked();
         assert!(!cx.has_pending_prompt());
         assert!(!task.await.unwrap());
+    }
+
+    #[gpui::test]
+    async fn test_window_and_project_removal_recheck_previously_prepared_items(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project_a = Project::test(fs.clone(), [], cx).await;
+        let project_b = Project::test(fs, [], cx).await;
+        let handle = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+        let workspace_a = handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let workspace_b = handle
+            .update(cx, |mw, window, cx| {
+                mw.open_sidebar(cx);
+                mw.test_add_workspace(project_b, window, cx)
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(handle.into(), cx);
+        let guarded = cx.new(TestItem::new);
+        let dirty = cx.new(|cx| {
+            TestItem::new(cx)
+                .with_dirty(true)
+                .with_project_items(&[TestProjectItem::new(1, "dirty.txt", cx)])
+        });
+        workspace_a.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(guarded.clone()), None, true, window, cx);
+        });
+        workspace_b.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(dirty.clone()), None, true, window, cx);
+        });
+        handle
+            .update(cx, |mw, window, cx| {
+                mw.activate(workspace_a.clone(), None, window, cx)
+            })
+            .unwrap();
+
+        let close = cx.spawn(|mut cx| async move {
+            prepare_window_to_close(handle, CloseIntent::CloseWindow, &mut cx).await
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        guarded.update(cx, |item, _| item.can_close = false);
+        cx.simulate_prompt_answer("Don't Save");
+        assert!(!close.await.unwrap());
+        assert!(!workspace_a.read_with(cx, |workspace, _| workspace.removing));
+
+        guarded.update(cx, |item, _| item.can_close = true);
+        dirty.update(cx, |item, _| item.is_dirty = true);
+        let remove = handle
+            .update(cx, |mw, window, cx| {
+                mw.remove(
+                    [workspace_a.clone(), workspace_b.clone()],
+                    RemovalIntent::CloseProject,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        guarded.update(cx, |item, _| item.can_close = false);
+        cx.simulate_prompt_answer("Don't Save");
+        assert!(!remove.await.unwrap());
+        assert_eq!(
+            handle
+                .read_with(cx, |mw, _| mw.workspaces().count())
+                .unwrap(),
+            2
+        );
     }
 
     #[gpui::test]
